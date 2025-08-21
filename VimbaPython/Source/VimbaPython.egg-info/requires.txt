@@ -1,0 +1,14 @@
+
+[numpy-export]
+numpy
+
+[opencv-export]
+opencv-python
+
+[test]
+coverage
+docopt
+flake8
+flake8-junit-report
+mypy
+xmlrunner

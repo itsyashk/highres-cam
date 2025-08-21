@@ -1,0 +1,1 @@
+"""vimba_centroid_lab package.""" 

@@ -1,0 +1,11 @@
+PySide6>=6.7,<6.8  # pin to ensure cp310 wheels exist
+numpy>=1.24
+opencv-python>=4.9
+scipy>=1.11
+PyYAML>=6.0
+# VimbaPython is provided by Allied Vision SDK installer; not on PyPI
+# vimba
+pytest>=7.4 
+matplotlib>=3.8 
+fastapi>=0.111
+uvicorn[standard]>=0.30 

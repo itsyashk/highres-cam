@@ -1,0 +1,13 @@
+# Default configuration for vimba_centroid_lab
+pixel_size_mm_per_px: 0.6
+known_diameter_mm: 12.7
+threshold_core: 240      # intensity threshold for 'core' baseline centroid
+threshold_non_black: 20  # threshold for 'non-black' baseline centroid
+number_of_rays: 180
+roi_size_px: 40
+output_dir: output
+buffer_count: 8
+percentile_threshold: 99.5  # percentile for blob detection threshold
+max_candidates: 3 
+capture_series_length: 50
+zoom_scale: 16 
