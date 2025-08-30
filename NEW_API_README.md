@@ -157,3 +157,4 @@ The new system is backward compatible with the existing camera controller interf
 - Better error messages and user feedback
 
 The core camera control logic remains unchanged, ensuring compatibility with existing Vimba camera hardware.
+

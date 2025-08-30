@@ -6,9 +6,9 @@ numpy
 opencv-python
 
 [test]
-coverage
-docopt
+xmlrunner
 flake8
 flake8-junit-report
 mypy
-xmlrunner
+coverage
+docopt

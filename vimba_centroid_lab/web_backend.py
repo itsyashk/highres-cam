@@ -15,6 +15,7 @@ from threading import Thread
 from typing import List, Dict, Any, Optional
 import csv
 import os
+from pathlib import Path  # NEW: for saving photos
 
 from vimba import Vimba, FrameStatus, Camera, PixelFormat
 from .camera_vimba import CameraController
@@ -35,6 +36,7 @@ app.add_middleware(
 camera_queue: Queue[np.ndarray] = Queue(maxsize=10)
 websocket_queue: Queue[np.ndarray] = Queue(maxsize=10)
 cam = CameraController(camera_queue)
+photo_save_queue: "queue.Queue[np.ndarray]" | None = None  # NEW global queue for async saving
 
 # WebSocket connection manager
 class ConnectionManager:
@@ -76,7 +78,10 @@ camera_state = {
     "subpixel_centroid": None,
     "current_frame": None,
     "camera_controller": cam,
-    "last_update": time.time()
+    "last_update": time.time(),
+    "save_photos": False,          # NEW: flag to trigger photo burst
+    "save_remaining": 0,           # NEW: remaining photos to save
+    "save_target": 1000            # NEW: desired photo count
 }
 
 # Validation functions
@@ -109,7 +114,7 @@ async def get_camera_status():
 async def set_exposure(data: Dict[str, Any], background_tasks: BackgroundTasks):
     """Set camera exposure with validation and real-time updates."""
     try:
-        exposure = float(data.get("exposure", 5000))
+        exposure = float(data.get("exposure", 5_000_000))
         
         # Validate input
         if not validate_exposure(exposure):
@@ -432,6 +437,17 @@ async def get_zoom_view():
         print(f"❌ ZOOM VIEW ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/save-photos")  # NEW ENDPOINT
+async def save_photos(data: Dict[str, Any]):
+    """Begin saving a burst of photos to tests/1000photos directory."""
+    frames = int(data.get("frames", 1000))
+    if frames <= 0:
+        raise HTTPException(status_code=400, detail="frames must be >0")
+    camera_state["save_photos"] = True
+    camera_state["save_remaining"] = frames
+    camera_state["save_target"] = frames
+    return {"success": True, "frames": frames}
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -470,8 +486,22 @@ async def startup_event():
                         print(f"✓ Received frame #{frame_count} (shape: {frame.shape}, dtype: {frame.dtype}, FPS: {fps:.1f})")
                         
                         camera_state["current_frame"] = frame.copy()
-                        #print(f"✓ Stored frame in camera_state")
-                        
+                        # -------------------------------------------------
+                        # NEW: Photo burst saving
+                        if camera_state["save_photos"] and camera_state["save_remaining"] > 0:
+                            try:
+                                idx = camera_state["save_target"] - camera_state["save_remaining"]
+                                if photo_save_queue and not photo_save_queue.full():
+                                    photo_save_queue.put((idx, frame.copy()))
+                                    camera_state["save_remaining"] -= 1
+                                    if camera_state["save_remaining"] == 0:
+                                        camera_state["save_photos"] = False
+                                        print("✓ Photo burst capture queued for saving")
+                                else:
+                                    print("⚠ Save queue full, skipping frame")
+                            except Exception as e:
+                                print(f"❌ Failed to queue photo: {e}")
+                        # -------------------------------------------------
                         # Process frame for centroid analysis if blob is selected
                         if camera_state["selected_blob"]:
                             print(f"Processing centroid analysis for blob at {camera_state['selected_blob']}")
@@ -943,7 +973,7 @@ async def index():
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>Vimba Vision Lab</h1>
+                    <h1>850nm @ 20.2MP Vision Lab</h1>
                     <p>High-Precision Camera Centroid Analysis</p>
                 </div>
                 
@@ -956,6 +986,9 @@ async def index():
                             </button>
                             <button id="captureBtn" class="btn btn-secondary" onclick="captureFrame()" disabled>
                                 📸 Capture Frame
+                            </button>
+                            <button id="savePhotosBtn" class="btn btn-secondary" onclick="savePhotos()" disabled>
+                                💾 Save 1000 Photos
                             </button>
                         </div>
 
@@ -975,9 +1008,9 @@ async def index():
                             <div class="slider-group">
                                 <div class="slider-label">
                                     <span>Exposure (µs)</span>
-                                    <span id="exposureValue">7500</span>
+                                    <span id="exposureValue">5000</span>
                                 </div>
-                                <input type="range" id="exposureSlider" class="slider" min="100" max="20000" value="7500">
+                                <input type="range" id="exposureSlider" class="slider" min="100" max="20000" value="5000">
                             </div>
                             <div class="slider-group">
                                 <div class="slider-label">
@@ -1089,6 +1122,7 @@ async def index():
                 const startBtn = document.getElementById('startBtn');
                 const startText = document.getElementById('startText');
                 const captureBtn = document.getElementById('captureBtn');
+                const savePhotosBtn = document.getElementById('savePhotosBtn'); // NEW
                 const seriesBtn = document.getElementById('seriesBtn');
                 const status = document.getElementById('status');
                 const statusDot = document.getElementById('statusDot');
@@ -1281,6 +1315,7 @@ async def index():
                         startBtn.className = 'btn btn-danger';
                         captureBtn.disabled = false;
                         seriesBtn.disabled = false;
+                        savePhotosBtn.disabled = false; // NEW enable when streaming
                         status.textContent = 'Streaming live feed';
                         statusDot.className = 'status-dot streaming';
                         img.style.display = 'inline';
@@ -1323,6 +1358,7 @@ async def index():
                     startBtn.className = 'btn btn-primary';
                     captureBtn.disabled = true;
                     seriesBtn.disabled = true;
+                    savePhotosBtn.disabled = true; // NEW disable when not streaming
                     status.textContent = 'Ready to start streaming';
                     statusDot.className = 'status-dot ready';
                     img.style.display = 'none';
@@ -1622,6 +1658,30 @@ async def index():
                             if (isStreaming) status.textContent = 'Streaming live feed';
                         }, 2000);
                     }
+                }
+
+                function savePhotos() { // NEW
+                    savePhotosBtn.disabled = true;
+                    fetch('/api/save-photos', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({frames: 1000})
+                    })
+                    .then(resp => resp.json())
+                    .then(data => {
+                        if (data.success) {
+                            showNotification('Started saving 1000 photos', 'success');
+                        } else {
+                            throw new Error('Failed to start saving photos');
+                        }
+                    })
+                    .catch(err => {
+                        console.error(err);
+                        showNotification('Error: ' + err.message, 'error');
+                    })
+                    .finally(() => {
+                        savePhotosBtn.disabled = false;
+                    });
                 }
             </script>
         </body>

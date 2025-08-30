@@ -272,13 +272,10 @@ class CameraController(BaseCamera):
 
     # Proxy methods ------------------------------------------------------
     def start(self):
-        try:
-            self.cam.start()
-        except Exception as e:
-            print(f"⚠ Real camera failed to start ({e}). Falling back to MockCamera for development.")
-            # Replace cam with MockCamera and start it
-            self.cam = MockCamera(self.q)
-            self.cam.start()
+        # Attempt to start the real Allied Vision camera. If this fails, we
+        # deliberately propagate the exception instead of silently falling back
+        # to a synthetic MockCamera so that issues are detected immediately.
+        self.cam.start()
 
     def stop(self):
         self.cam.stop()
