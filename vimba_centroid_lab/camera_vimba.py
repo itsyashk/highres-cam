@@ -316,6 +316,63 @@ class VimbaCamera(BaseCamera):
         if self._cam:
             self._cam.AcquisitionFrameRate.set(fps)
 
+    def capture_single_frame(self, timeout_ms: int = 2000):
+        """Capture a single frame synchronously (for time-multiplexed mode).
+        
+        Returns the frame as numpy array or None if failed.
+        """
+        if not self._cam:
+            print(f"❌ Camera {self.camera_id} not available for single capture")
+            return None
+            
+        try:
+            # Use get_frame() for synchronous single-frame capture
+            frame = self._cam.get_frame(timeout_ms=timeout_ms)
+            
+            if frame.get_status() == FrameStatus.Complete:
+                img = frame.as_numpy_ndarray()
+                print(f"📸 Single frame captured from {self.camera_id}: {img.shape}")
+                return img.copy()
+            else:
+                print(f"⚠ Single capture got incomplete frame from {self.camera_id}: status={frame.get_status()}")
+                return None
+        except Exception as e:
+            print(f"❌ Single frame capture error for {self.camera_id}: {e}")
+            return None
+
+    def open_for_capture(self):
+        """Open camera for single-frame capture mode (not streaming)."""
+        if not self._cam:
+            print(f"❌ No camera attached")
+            return False
+            
+        try:
+            from vimba import AccessMode
+            self._cam.set_access_mode(AccessMode.Full)
+            self._cam.__enter__()
+            
+            # Set pixel format
+            try:
+                from vimba import PixelFormat as PF
+                self._cam.set_pixel_format(PF.Mono8)
+            except:
+                pass
+                
+            print(f"✓ Camera {self.camera_id} opened for single-frame capture")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to open camera {self.camera_id}: {e}")
+            return False
+
+    def close_capture(self):
+        """Close camera after single-frame capture session."""
+        if self._cam:
+            try:
+                self._cam.__exit__(None, None, None)
+                print(f"✓ Camera {self.camera_id} closed")
+            except Exception as e:
+                print(f"⚠ Error closing camera {self.camera_id}: {e}")
+
 
 class CameraController:
     """Unified facade managing multiple cameras (real or mock)."""
@@ -400,4 +457,126 @@ class CameraController:
     
     def get_queues(self) -> List[Queue]:
         return self.queues
- 
+
+    def start_multiplexed(self, interval_seconds: float = 1.0):
+        """Start TRUE time-multiplexed capture mode.
+        
+        Only ONE camera is ever active at a time:
+        - t=0.0: Start Camera 0, capture frame, stop
+        - t=0.5: Start Camera 1, capture frame, stop  
+        - t=1.0: Start Camera 0, capture frame, stop
+        - etc.
+        
+        Args:
+            interval_seconds: Total cycle time for one full round of all cameras.
+        """
+        print("=== STARTING TRUE ALTERNATING CAPTURE MODE ===")
+        
+        # 1. Discover cameras (don't start them yet)
+        if self.Vimba and len(self.cameras) == 0:
+            try:
+                self._vimba_ctx = self.Vimba.get_instance()
+                self._vimba_ctx.__enter__()
+                
+                cams_found = self._vimba_ctx.get_all_cameras()
+                print(f"✓ Vimba found {len(cams_found)} camera(s)")
+                
+                for cam_obj in cams_found:
+                    q = Queue(maxsize=30)
+                    vcam = VimbaCamera(q)
+                    vcam.attach_camera(cam_obj)
+                    self.cameras.append(vcam)
+                    self.queues.append(q)
+                    
+            except Exception as e:
+                print(f"❌ Error discovering cameras: {e}")
+                if self._vimba_ctx:
+                    self._vimba_ctx.__exit__(None, None, None)
+                    self._vimba_ctx = None
+                return
+        
+        if len(self.cameras) == 0:
+            print("❌ No cameras available for multiplexed capture")
+            return
+
+        num_cameras = len(self.cameras)
+        per_camera_interval = interval_seconds / num_cameras
+        print(f"📸 Alternating mode: {num_cameras} cameras, {per_camera_interval}s per camera")
+        
+        # Start the alternating capture thread
+        self._multiplex_stop = threading.Event()
+        self._multiplex_thread = threading.Thread(
+            target=self._alternating_capture_loop,
+            args=(per_camera_interval,),
+            daemon=True
+        )
+        self._multiplex_thread.start()
+        print("✓ Alternating capture scheduler started")
+    
+    def _alternating_capture_loop(self, capture_interval: float):
+        """True alternating capture - only ONE camera active at any time."""
+        import time
+        
+        num_cameras = len(self.cameras)
+        current_camera = 0
+        
+        print(f"=== ALTERNATING CAPTURE LOOP STARTED ===")
+        print(f"    {num_cameras} cameras, {capture_interval}s between each")
+        
+        while not self._multiplex_stop.is_set():
+            cam = self.cameras[current_camera]
+            q = self.queues[current_camera]
+            
+            try:
+                # START this camera
+                print(f"📷 [{current_camera}] Starting camera...")
+                cam.start()
+                
+                # Wait for a frame to arrive in the queue
+                start_time = time.time()
+                frame_received = False
+                while time.time() - start_time < 2.0:  # 2s timeout
+                    if not q.empty():
+                        # Frame captured! Leave it in the queue for backend to process
+                        frame_received = True
+                        print(f"✓ [{current_camera}] Frame captured")
+                        break
+                    time.sleep(0.05)
+                
+                if not frame_received:
+                    print(f"⚠ [{current_camera}] No frame received in 2s timeout")
+                
+                # STOP this camera
+                print(f"🛑 [{current_camera}] Stopping camera...")
+                cam.stop()
+                
+            except Exception as e:
+                print(f"❌ [{current_camera}] Error: {e}")
+                try:
+                    cam.stop()
+                except:
+                    pass
+            
+            # Move to next camera
+            current_camera = (current_camera + 1) % num_cameras
+            
+            # Wait before starting next camera
+            time.sleep(capture_interval)
+        
+        print("=== ALTERNATING CAPTURE LOOP STOPPED ===")
+    
+    def stop_multiplexed(self):
+        """Stop time-multiplexed capture mode."""
+        if hasattr(self, '_multiplex_stop'):
+            self._multiplex_stop.set()
+        if hasattr(self, '_multiplex_thread') and self._multiplex_thread.is_alive():
+            self._multiplex_thread.join(timeout=2.0)
+        
+        # Make sure all cameras are stopped
+        for cam in self.cameras:
+            try:
+                cam.stop()
+            except:
+                pass
+        
+        print("✓ Alternating capture stopped")

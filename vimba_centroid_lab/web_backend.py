@@ -336,22 +336,41 @@ async def websocket_endpoint(websocket: WebSocket):
 # WebSocket endpoint for video streaming - MULTI CAMERA SUPPORT
 @app.websocket("/ws/{camera_index}")
 async def video_websocket_endpoint(websocket: WebSocket, camera_index: int):
-    print(f"🔌 Video WebSocket connection established for Camera {camera_index}")
-    await websocket.accept()
+    print(f"🔌 Incoming WebSocket connection request for /ws/{camera_index}")
     
-    # Check if this camera index exists
-    if camera_index < 0 or camera_index >= len(websocket_queues):
-        print(f"❌ Invalid camera index {camera_index} (total: {len(websocket_queues)})")
+    # Check if queues are initialized
+    if not websocket_queues:
+        print(f"❌ WebSocket error: No queues initialized yet (len={len(websocket_queues)})")
         await websocket.close()
         return
 
+    if camera_index >= len(websocket_queues):
+        print(f"❌ WebSocket error: Invalid camera index {camera_index} (max {len(websocket_queues)-1})")
+        await websocket.close()
+        return
+        
+    print(f"🔌 Connecting WebSocket to Camera {camera_index} queue...")
+    await websocket.accept()
+    print(f"🔌 WebSocket connection established for Camera {camera_index}")
+    
     q = websocket_queues[camera_index]
     frame_count = 0
+    
     try:
         while True:
+
             # Wait for frames from the camera thread
             try:
-                frame = q.get(timeout=1.0)
+                # CRITICAL FIX: Use run_in_executor to avoid blocking the asyncio event loop
+                # The queue.Queue.get method is blocking. Running it in a thread pool allows
+                # the event loop to continue processing other requests (like new WebSocket connections)
+                frame = await asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    q.get, 
+                    True, # block
+                    0.1   # timeout (reduced to 100ms for better responsiveness)
+                )
+                
                 if frame is not None:
                     frame_count += 1
                     
@@ -364,7 +383,8 @@ async def video_websocket_endpoint(websocket: WebSocket, camera_index: int):
                     if frame_count <= 5 or frame_count % 100 == 0:
                         print(f"✓ Frame #{frame_count} sent to browser (Cam {camera_index}, {len(jpeg_data)} bytes)")
             except Exception as e:
-                if "Empty" in str(type(e).__name__):
+                # Handle Empty queue which raises directly or wrapped in execution error
+                if "Empty" in str(type(e).__name__) or "Empty" in str(e):
                     # No frame available, send a keep-alive
                     await websocket.send_text("keepalive")
                 else:
@@ -697,8 +717,11 @@ async def startup_event():
         time.sleep(1)
         
         try:
-            print("Starting camera controller...")
-            camera_state["camera_controller"].start()
+            print("Starting camera controller in MULTIPLEXED mode...")
+            # Use time-multiplexed capture (1 frame/camera/second, staggered)
+            # This avoids packet collision by only capturing from one camera at a time
+            camera_state["camera_controller"].start_multiplexed(interval_seconds=1.0)
+
             
             # Get the queues created by the controller
             queues = camera_state["camera_controller"].get_queues()
@@ -1172,14 +1195,18 @@ async def index():
                     <div class="control-panel">
                         <div class="control-section">
                             <h3>🎮 Stream Controls</h3>
-                            <button id="startBtn" class="btn btn-primary" onclick="toggleStream()">
-                                <span id="startText">▶️ Start Stream</span>
+                            <button id="startBtn1" class="btn btn-primary" onclick="toggleCamera(0)">
+                                <span id="startText1">▶️ Start Camera 1</span>
+                            </button>
+                            <button id="startBtn2" class="btn btn-primary" onclick="toggleCamera(1)">
+                                <span id="startText2">▶️ Start Camera 2</span>
                             </button>
                             <button id="captureBtn" class="btn btn-secondary" onclick="captureFrame()" disabled>
                                 📸 Capture Frame
                             </button>
                             <button id="savePhotosBtn" class="btn btn-secondary" onclick="savePhotos()" disabled>
                                 💾 Save 1000 Photos
+
                             </button>
                         </div>
 
@@ -1312,9 +1339,12 @@ async def index():
                 // DOM elements
                 const cameraGrid = document.getElementById('cameraGrid');
                 const noStream = document.getElementById('noStream');
-                const startBtn = document.getElementById('startBtn');
-                const startText = document.getElementById('startText');
+                const startBtn1 = document.getElementById('startBtn1');
+                const startBtn2 = document.getElementById('startBtn2');
+                const startText1 = document.getElementById('startText1');
+                const startText2 = document.getElementById('startText2');
                 const captureBtn = document.getElementById('captureBtn');
+
                 const savePhotosBtn = document.getElementById('savePhotosBtn'); // NEW
                 const seriesBtn = document.getElementById('seriesBtn');
                 const status = document.getElementById('status');
@@ -1491,6 +1521,99 @@ async def index():
                     frameCountElement.textContent = frameCount;
                 }
 
+                // Track which cameras are streaming
+                let cameraStreaming = [false, false];
+                let cameraWebsockets = [null, null];
+                
+                function toggleCamera(cameraIndex) {
+                    if (!cameraStreaming[cameraIndex]) {
+                        startCamera(cameraIndex);
+                    } else {
+                        stopCamera(cameraIndex);
+                    }
+                }
+                
+                function startCamera(cameraIndex) {
+                    status.textContent = `Starting Camera ${cameraIndex + 1}...`;
+                    statusDot.className = 'status-dot ready';
+                    
+                    // Create camera card if not exists
+                    let card = document.getElementById(`cam-card-${cameraIndex}`);
+                    if (!card) {
+                        card = document.createElement('div');
+                        card.className = 'camera-card';
+                        card.id = `cam-card-${cameraIndex}`;
+                        
+                        const title = document.createElement('div');
+                        title.className = 'cam-title';
+                        title.textContent = `Camera ${cameraIndex + 1}`;
+                        card.appendChild(title);
+                        
+                        const img = document.createElement('img');
+                        img.className = 'stream-img';
+                        img.id = `stream-${cameraIndex}`;
+                        img.alt = `Live stream camera ${cameraIndex}`;
+                        img.onclick = (e) => handleImageClick(e, cameraIndex);
+                        card.appendChild(img);
+                        
+                        cameraGrid.appendChild(card);
+                    }
+                    
+                    // Setup WebSocket
+                    const ws = new WebSocket(`ws://${location.host}/ws/${cameraIndex}`);
+                    ws.binaryType = 'arraybuffer';
+                    cameraWebsockets[cameraIndex] = ws;
+                    
+                    const imgId = `stream-${cameraIndex}`;
+                    
+                    ws.onopen = () => {
+                        console.log(`Connected to Camera ${cameraIndex + 1}`);
+                        status.textContent = `Camera ${cameraIndex + 1} connected`;
+                    };
+                    
+                    ws.onmessage = ev => {
+                        if (typeof ev.data === 'string' && ev.data === 'keepalive') return;
+                        const targetImg = document.getElementById(imgId);
+                        if (targetImg) {
+                            const blob = new Blob([ev.data], {type: 'image/jpeg'});
+                            targetImg.src = URL.createObjectURL(blob);
+                        }
+                        if (cameraIndex === 0) updateStats();
+                    };
+                    
+                    ws.onerror = (e) => {
+                        console.error(`Error Camera ${cameraIndex + 1}:`, e);
+                    };
+                    
+                    cameraStreaming[cameraIndex] = true;
+                    
+                    // Update button
+                    const btn = document.getElementById(`startBtn${cameraIndex + 1}`);
+                    const txt = document.getElementById(`startText${cameraIndex + 1}`);
+                    if (btn) btn.className = 'btn btn-danger';
+                    if (txt) txt.textContent = `⏹️ Stop Camera ${cameraIndex + 1}`;
+                    
+                    captureBtn.disabled = false;
+                }
+                
+                function stopCamera(cameraIndex) {
+                    if (cameraWebsockets[cameraIndex]) {
+                        cameraWebsockets[cameraIndex].close();
+                        cameraWebsockets[cameraIndex] = null;
+                    }
+                    
+                    cameraStreaming[cameraIndex] = false;
+                    
+                    // Update button
+                    const btn = document.getElementById(`startBtn${cameraIndex + 1}`);
+                    const txt = document.getElementById(`startText${cameraIndex + 1}`);
+                    if (btn) btn.className = 'btn btn-primary';
+                    if (txt) txt.textContent = `▶️ Start Camera ${cameraIndex + 1}`;
+                    
+                    status.textContent = `Camera ${cameraIndex + 1} stopped`;
+                }
+
+                // Legacy toggleStream - keep for compatibility
                 function toggleStream() {
                     if (!isStreaming) {
                         startStream();
@@ -1499,18 +1622,28 @@ async def index():
                     }
                 }
 
-                function startStream() {
+                async function startStream() {
                     status.textContent = 'Connecting...';
                     statusDot.className = 'status-dot ready';
                     
-                    // Fetch camera count first if not known (though state socket likely told us)
-                    // We'll proceed assuming cameraCount is set, or default to 1 if 0 (failsafe)
-                    const count = cameraCount || 1;
+                    // Always fetch camera count from API before starting
+                    try {
+                        const response = await fetch('/api/camera/status');
+                        const state = await response.json();
+                        cameraCount = state.camera_count || 1;
+                        console.log(`📸 Fetched camera count: ${cameraCount}`);
+                    } catch (e) {
+                        console.error('Failed to fetch camera count:', e);
+                        cameraCount = 1;
+                    }
+                    
+                    const count = cameraCount;
                     
                     cameraGrid.innerHTML = ''; // Clear grid
                     websockets = [];
                     
                     for (let i = 0; i < count; i++) {
+
                         // Create card
                         const card = document.createElement('div');
                         card.className = 'camera-card';
@@ -1533,18 +1666,26 @@ async def index():
                         const ws = new WebSocket(`ws://${location.host}/ws/${i}`);
                         ws.binaryType = 'arraybuffer';
                         
+                        // Capture camera index in closure
+                        const cameraIndex = i;
+                        const imgId = `stream-${i}`;
+                        
                         ws.onopen = () => {
-                            console.log(`Connected to Cam ${i}`);
+                            console.log(`Connected to Cam ${cameraIndex}`);
                         };
                         
                         ws.onmessage = ev => {
                            if (typeof ev.data === 'string' && ev.data === 'keepalive') return;
-                           const blob = new Blob([ev.data], {type: 'image/jpeg'});
-                           img.src = URL.createObjectURL(blob);
-                           if (i === 0) updateStats(); // Only update stats from primary
+                           const targetImg = document.getElementById(imgId);
+                           if (targetImg) {
+                               const blob = new Blob([ev.data], {type: 'image/jpeg'});
+                               targetImg.src = URL.createObjectURL(blob);
+                           }
+                           if (cameraIndex === 0) updateStats();
                         };
                         
                         ws.onerror = (e) => {
+
                              console.error(`Error Cam ${i}:`, e);
                         };
                         
