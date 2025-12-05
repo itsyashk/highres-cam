@@ -11,12 +11,12 @@ from __future__ import annotations
 import threading
 import time
 from queue import Queue
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 
 try:
-    from vimba import Vimba  # type: ignore
+    from vimba import Vimba, FrameStatus  # type: ignore
     VIMBA_AVAILABLE = True
 except ImportError:  # pragma: no cover
     VIMBA_AVAILABLE = False
@@ -55,7 +55,9 @@ class MockCamera(BaseCamera):
 
     def _generate_frame(self, t: float) -> np.ndarray:
         """Generate a blurred bright disk with slight motion for realism."""
-        x0 = int(self.width * (0.3 + 0.3 * np.sin(t * 0.7)))
+        # Offset motion based on queue ID to differentiate cameras
+        offset_x = (id(self.q) % 100) / 100.0
+        x0 = int(self.width * (0.3 + 0.3 * np.sin(t * 0.7 + offset_x * 6.28)))
         y0 = int(self.height * (0.3 + 0.3 * np.cos(t * 1.1)))
         yy, xx = np.indices((self.height, self.width))
         r = 120  # px
@@ -97,7 +99,7 @@ class MockCamera(BaseCamera):
 class VimbaCamera(BaseCamera):
     """Real Allied Vision camera via VimbaPython SDK."""
 
-    def __init__(self, frame_queue: Queue, camera_id: Optional[str] = None, buffer_count: int = 8):
+    def __init__(self, frame_queue: Queue, camera_id: Optional[str] = None, buffer_count: int = 32):
         if not VIMBA_AVAILABLE:
             raise RuntimeError("VimbaPython not available – install Allied Vision SDK")
         self.q = frame_queue
@@ -111,19 +113,30 @@ class VimbaCamera(BaseCamera):
     # Internal callbacks
     # ------------------------------------------------------------------
     def _on_frame(self, cam, frame):  # type: ignore
+        print(f"DEBUG: _on_frame callback called for {self.camera_id}")
         try:
-            img = frame.as_numpy_ndarray()
-            #print(f"📸 Frame received from camera: shape={img.shape}, dtype={img.dtype}, min={img.min()}, max={img.max()}")
-            
-            if not self.q.full():
-                self.q.put(img.copy())
-                #print(f"✓ Frame queued (queue size: {self.q.qsize()})")
-            else:
-                print(f"⚠ Frame queue full, dropping frame")
+            status = frame.get_status()
+            if status == FrameStatus.Complete:
+                img = frame.as_numpy_ndarray()
+                print(f"📸 COMPLETE Frame received from {self.camera_id}: {img.shape}")
                 
+                if not self.q.full():
+                    self.q.put(img.copy())
+                    print(f"📦 Frame queued for {self.camera_id}")
+                else:
+                    print(f"⚠ Frame queue full for {self.camera_id}, dropping frame")
+            else:
+
+                # Log incomplete frames with camera ID (less spammy - only first few)
+                if not hasattr(self, '_incomplete_count'):
+                    self._incomplete_count = 0
+                self._incomplete_count += 1
+                if self._incomplete_count <= 5 or self._incomplete_count % 100 == 0:
+                    print(f"⚠ [{self.camera_id}] Incomplete frame #{self._incomplete_count}: status={status}")
+
+
             # CRITICAL: Always queue the frame back to the camera to keep streaming alive
             cam.queue_frame(frame)
-            #print(f"✓ Frame recycled back to camera")
             
         except Exception as e:
             print(f"❌ Frame handler error: {e}")
@@ -132,7 +145,6 @@ class VimbaCamera(BaseCamera):
             # Even on error, try to recycle the frame
             try:
                 cam.queue_frame(frame)
-               # print(f"✓ Frame recycled back to camera (error recovery)")
             except:
                 print(f"❌ Failed to recycle frame after error")
 
@@ -140,104 +152,150 @@ class VimbaCamera(BaseCamera):
     # Public API
     # ------------------------------------------------------------------
     def start(self):
-        from vimba import Vimba  # local import to guard availability
-
         print("=== VIMBA CAMERA STARTUP ===")
         
-        # Keep instance alive until stop() is called
-        print("Getting Vimba instance...")
-        self._vimba_ctx = Vimba.get_instance()
-        self._vimba_ctx.__enter__()
-        print("✓ Vimba instance acquired")
+        # NOTE: self._vimba_ctx must be managed by the Controller to share Vimba instance across cameras
+        # For this single camera class, we assume we are given a camera object from the controller
+        
+        if not self._cam:
+             raise RuntimeError("Camera not initialized. Controller must assign a camera instance.")
 
-        vimba = self._vimba_ctx
-        print("Discovering cameras...")
-        cams = vimba.get_all_cameras()
-        print(f"✓ Found {len(cams)} camera(s)")
-        
-        if not cams:
-            raise RuntimeError("No Allied Vision cameras detected")
-            
-        if self.camera_id:
-            print(f"Looking for specific camera ID: {self.camera_id}")
-            cam = next((c for c in cams if c.get_id() == self.camera_id), cams[0])
-            print(f"✓ Selected camera: {cam.get_id()}")
-        else:
-            cam = cams[0]
-            print(f"✓ Using first available camera: {cam.get_id()}")
-            
-        self._cam = cam
-        
-        # Enter camera context (opens the camera)
-        print("Opening camera (AccessMode.Full)...")
+        print(f"Opening camera {self.camera_id} (AccessMode.Full)...")
         from vimba import AccessMode  # type: ignore
         try:
-            cam.open(access_mode=AccessMode.Full)
+            # Set access mode before entering context (as per VimbaPython API)
+            self._cam.set_access_mode(AccessMode.Full)
+            
+            # Use context manager protocol which is standard for VimbaPython
+            # We manually call __enter__ to keep it open until stop() is called
+            self._cam.__enter__()
+            print(f"✓ Camera {self.camera_id} opened successfully")
         except Exception as e:
-            print(f"❌ Failed to open camera with AccessMode.Full: {e}")
-            # Fallback to default __enter__ as last resort
-            try:
-                cam.__enter__()
-            except Exception as e2:
-                print(f"❌ Fallback camera open failed: {e2}")
-                raise
-        print("✓ Camera opened successfully")
+            print(f"❌ Failed to open camera {self.camera_id}: {e}")
+            raise
 
         # Adjust packet size for GigE, ignore errors
         print("Attempting to adjust GigE packet size...")
         try:
-            cam.GVSPAdjustPacketSize.run()
-            while not cam.GVSPAdjustPacketSize.is_done():
+            self._cam.GVSPAdjustPacketSize.run()
+            while not self._cam.GVSPAdjustPacketSize.is_done():
                 pass
             print("✓ GigE packet size adjusted")
         except Exception as e:
             print(f"⚠ GigE packet size adjustment failed (not a GigE camera?): {e}")
 
-        # Ensure Mono8 pixel format
-        print("Setting pixel format to Mono8...")
+        # Set Bandwidth Limit for multi-camera operation
+        # 31 MB/s is camera minimum - trying this for dual-camera stability
+        TARGET_BANDWIDTH = 31_000_000
+        print(f"Setting StreamBytesPerSecond to {TARGET_BANDWIDTH}...")
+
+
+
         try:
-            cam.set_pixel_format("Mono8")
-            print("✓ Pixel format set to Mono8 (method 1)")
-        except Exception as e:
-            print(f"⚠ Method 1 failed: {e}")
+            # Try setting StreamBytesPerSecond directly
             try:
-                cam.PixelFormat.set("Mono8")
-                print("✓ Pixel format set to Mono8 (method 2)")
-            except Exception as e:
-                print(f"⚠ Could not set pixel format to Mono8: {e}")
-                print("⚠ Continuing anyway - some cameras might not support this")
+                feat = self._cam.get_feature_by_name("StreamBytesPerSecond")
+                feat.set(TARGET_BANDWIDTH)
+                print(f"✓ StreamBytesPerSecond set to {TARGET_BANDWIDTH}")
+            except Exception:
+                # Fallback to DeviceLinkThroughputLimit
+                feat = self._cam.get_feature_by_name("DeviceLinkThroughputLimit")
+                feat.set(TARGET_BANDWIDTH)
+                print(f"✓ DeviceLinkThroughputLimit set to {TARGET_BANDWIDTH}")
+        except Exception as e:
+            print(f"⚠ Failed to set bandwidth limit: {e}")
+
+        # NEW: Set Inter-Packet Delay for multi-camera GigE stability
+        # This gives the NIC time to process each packet, reducing frame loss
+        print("Setting GigE inter-packet delay (GevSCPD)...")
+        try:
+            # GevSCPD = Stream Channel Packet Delay (in clock ticks)
+            # Higher values = slower streaming but more reliable
+            feat = self._cam.get_feature_by_name("GevSCPD")
+            feat.set(10000)  # ~10000 ticks delay
+            print(f"✓ GevSCPD set to 10000")
+        except Exception as e:
+            print(f"⚠ Failed to set GevSCPD: {e}")
+            
+        # Also try frame transmission delay if available
+        try:
+            feat = self._cam.get_feature_by_name("GevSCFTD")
+            feat.set(100000)  # Frame transmission delay
+            print(f"✓ GevSCFTD set to 100000")
+        except Exception as e:
+            print(f"⚠ GevSCFTD not available: {e}")
+
+
+
+        # Ensure Mono8 pixel format if supported by SDK/camera
+        print("Setting pixel format to Mono8 if supported...")
+        try:
+            # Prefer enum-based API when available
+            from vimba import PixelFormat as PF  # type: ignore
+            try:
+                self._cam.set_pixel_format(PF.Mono8)  # enum expected by some SDK versions
+                print("✓ Pixel format set to Mono8 via set_pixel_format(enum)")
+            except Exception as e1:
+                print(f"⚠ set_pixel_format(enum) failed: {e1}")
+                try:
+                    feat = self._cam.get_feature_by_name('PixelFormat')
+                    # Try enum value if present in feature API
+                    try:
+                        feat.set(PF.Mono8)  # some SDKs accept enum here
+                        print("✓ Pixel format set to Mono8 via feature.set(enum)")
+                    except Exception as e1b:
+                        # Fallback to string name
+                        feat.set('Mono8')
+                        print("✓ Pixel format set to Mono8 via feature.set('Mono8')")
+                except Exception as e2:
+                    print(f"⚠ Feature API fallback failed: {e2}")
+        except Exception as e:
+            # If PF import or all attempts fail, just continue with current format
+            print(f"⚠ Could not enforce Mono8 pixel format: {e}")
+            print("⚠ Continuing with camera default pixel format")
 
         print(f"Starting streaming with buffer_count={self.buffer_count}...")
-        cam.start_streaming(handler=self._on_frame, buffer_count=self.buffer_count)
+        self._cam.start_streaming(handler=self._on_frame, buffer_count=self.buffer_count)
         self._running = True
-        print("✓ Camera streaming started successfully")
-        print("=== VIMBA CAMERA STARTUP COMPLETE ===")
+        print(f"✓ Camera {self.camera_id} streaming started successfully")
+
+    def attach_camera(self, cam_obj):
+        """Attaches a Vimba Camera object found by the controller."""
+        self._cam = cam_obj
+        self.camera_id = cam_obj.get_id()
 
     def stop(self):
         if self._cam and self._running:
-            self._cam.stop_streaming()
+            try:
+                self._cam.stop_streaming()
+            except Exception: 
+                pass
             # Exit camera context (closes)
             self._cam.__exit__(None, None, None)
             self._running = False
 
-        if self._vimba_ctx:
-            self._vimba_ctx.__exit__(None, None, None)
-            self._vimba_ctx = None
+    # Detached context management from VimbaCamera to CameraController
 
     def set_exposure(self, exposure_us: float) -> None:
         """Set camera exposure time in microseconds."""
         if hasattr(self, '_cam') and self._cam:
             try:
                 self._cam.ExposureTime.set(exposure_us)
-                print(f"Successfully set exposure to {exposure_us} µs")
+                # Verify the setting was applied
+                actual_exposure = self._cam.ExposureTime.get()
+                print(f"✓ Set exposure to {exposure_us} µs (actual: {actual_exposure} µs)")
             except Exception as e:
-                print(f"Failed to set exposure: {e}")
+                print(f"❌ Failed to set exposure: {e}")
                 # Try alternative method
                 try:
-                    self._cam.get_feature_by_name('ExposureTime').set(exposure_us)
-                    print(f"Successfully set exposure to {exposure_us} µs (alternative method)")
+                    feat = self._cam.get_feature_by_name('ExposureTime')
+                    feat.set(exposure_us)
+                    actual_exposure = feat.get()
+                    print(f"✓ Set exposure to {exposure_us} µs via feature (actual: {actual_exposure} µs)")
                 except Exception as e2:
-                    print(f"Failed to set exposure with alternative method: {e2}")
+                    print(f"❌ Failed to set exposure with alternative method: {e2}")
+        else:
+            print(f"❌ Camera not available for exposure setting")
 
     def set_gain(self, gain_db: float) -> None:
         """Set camera gain in dB."""
@@ -259,32 +317,87 @@ class VimbaCamera(BaseCamera):
             self._cam.AcquisitionFrameRate.set(fps)
 
 
-class CameraController(BaseCamera):
-    """Unified facade choosing real or mock camera automatically."""
+class CameraController:
+    """Unified facade managing multiple cameras (real or mock)."""
 
-    def __init__(self, frame_queue: Queue):
-        self.q = frame_queue
-        if not VIMBA_AVAILABLE:
-            raise RuntimeError("VimbaPython SDK not found – install Allied Vision Vimba and ensure Python bindings are available.")
+    def __init__(self):
+        # We process cameras into a list of (camera_instance, queue)
+        self.cameras: List[BaseCamera] = []
+        self.queues: List[Queue] = []
+        self._vimba_ctx = None
+        
+        if VIMBA_AVAILABLE:
+            from vimba import Vimba
+            self.Vimba = Vimba
+        else:
+            self.Vimba = None
 
-        # Instantiate real camera; raise any errors to caller instead of silently falling back.
-        self.cam: BaseCamera = VimbaCamera(frame_queue)
-
-    # Proxy methods ------------------------------------------------------
     def start(self):
-        # Attempt to start the real Allied Vision camera. If this fails, we
-        # deliberately propagate the exception instead of silently falling back
-        # to a synthetic MockCamera so that issues are detected immediately.
-        self.cam.start()
+        """Discover and start all connected cameras."""
+        print("=== CAMERA CONTROLLER STARTUP ===")
+        
+        # 1. Try Vimba
+        if self.Vimba:
+            try:
+                self._vimba_ctx = self.Vimba.get_instance()
+                self._vimba_ctx.__enter__()
+                
+                cams_found = self._vimba_ctx.get_all_cameras()
+                print(f"✓ Vimba found {len(cams_found)} camera(s)")
+                
+                for cam_obj in cams_found:
+                    q = Queue(maxsize=30)
+                    vcam = VimbaCamera(q)
+                    vcam.attach_camera(cam_obj)
+                    self.cameras.append(vcam)
+                    self.queues.append(q)
+
+                    
+            except Exception as e:
+                print(f"❌ Error initializing Vimba: {e}")
+                print(f"❌ Failed to initialize Vimba: {e}")
+                if self._vimba_ctx:
+                    self._vimba_ctx.__exit__(None, None, None)
+                    self._vimba_ctx = None
+        
+        # 2. If no cameras found, do NOT fall back to mock cameras (per user request)
+        if len(self.cameras) == 0:
+            print("❌ No cameras detected! Please check connections.")
+                
+        # 3. Start all cameras with staggered delays
+        import time
+        for i, cam in enumerate(self.cameras):
+            print(f"Starting camera #{i}...")
+            cam.start()
+            if i < len(self.cameras) - 1:
+                print(f"⏳ Waiting 3 seconds before starting next camera...")
+                time.sleep(3)  # Stagger to prevent simultaneous stream bursts
+            
+        print(f"✓ All {len(self.cameras)} cameras started.")
+
 
     def stop(self):
-        self.cam.stop()
+        """Stop all cameras."""
+        for cam in self.cameras:
+            cam.stop()
+        
+        if self._vimba_ctx:
+            self._vimba_ctx.__exit__(None, None, None)
+            self._vimba_ctx = None
 
+    # Global Setters (apply to all cameras)
     def set_exposure(self, us):
-        self.cam.set_exposure(us)
+        for cam in self.cameras:
+            cam.set_exposure(us)
 
     def set_gain(self, db):
-        self.cam.set_gain(db)
+        for cam in self.cameras:
+            cam.set_gain(db)
 
     def set_frame_rate(self, fps):
-        self.cam.set_frame_rate(fps) 
+        for cam in self.cameras:
+            cam.set_frame_rate(fps)
+    
+    def get_queues(self) -> List[Queue]:
+        return self.queues
+ 

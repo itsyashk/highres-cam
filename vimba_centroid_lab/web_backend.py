@@ -11,6 +11,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Back
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from queue import Queue
+import queue
 from threading import Thread
 from typing import List, Dict, Any, Optional
 import csv
@@ -33,10 +34,18 @@ app.add_middleware(
 )
 
 # Separate queues for camera output and WebSocket streaming
-camera_queue: Queue[np.ndarray] = Queue(maxsize=10)
-websocket_queue: Queue[np.ndarray] = Queue(maxsize=10)
-cam = CameraController(camera_queue)
-photo_save_queue: "queue.Queue[np.ndarray]" | None = None  # NEW global queue for async saving
+# Separate queues for camera output and WebSocket streaming
+# Now handling N cameras, so we use Configurable lists/dicts
+camera_queues: List[Queue] = []
+websocket_queues: List[Queue] = [] 
+
+# We defer Controller initialization to startup so we can dynamically create queues
+cam_controller = CameraController()
+photo_save_queue: queue.Queue | None = None  # NEW global queue for async saving
+
+# Tuning for burst saving
+PHOTO_SAVE_WORKERS = min(8, max(2, (os.cpu_count() or 4)))
+PHOTO_SAVE_QUEUE_MAX = 32  # guard RAM usage; each raw frame is large
 
 # WebSocket connection manager
 class ConnectionManager:
@@ -65,8 +74,9 @@ manager = ConnectionManager()
 
 # Global state with validation
 camera_state = {
-    "exposure": 5000,
+    "exposure": 5000,  # Set to 5000µs (5ms) for consistent exposure
     "gain": 0,
+    "frame_rate": 5.0,  # FPS
     "streaming": False,
     "capture_series": False,
     "series_data": [],
@@ -76,8 +86,11 @@ camera_state = {
     "selected_blob": None,
     "baseline_centroid": None,
     "subpixel_centroid": None,
-    "current_frame": None,
-    "camera_controller": cam,
+    "selected_blob": None,
+    "baseline_centroid": None,
+    "subpixel_centroid": None,
+    "current_frames": {}, # Map camera_index -> frame
+    "camera_controller": cam_controller,
     "last_update": time.time(),
     "save_photos": False,          # NEW: flag to trigger photo burst
     "save_remaining": 0,           # NEW: remaining photos to save
@@ -87,7 +100,7 @@ camera_state = {
 # Validation functions
 def validate_exposure(exposure: float) -> bool:
     """Validate exposure value is within reasonable range."""
-    return 100 <= exposure <= 100000  # 100µs to 100ms
+    return 100 <= exposure <= 100000  # 100µs to 100ms (5000µs is valid)
 
 def validate_gain(gain: float) -> bool:
     """Validate gain value is within reasonable range."""
@@ -98,6 +111,7 @@ def validate_gain(gain: float) -> bool:
 async def get_camera_status():
     """Get comprehensive camera status including current parameters."""
     return {
+        "camera_count": len(camera_state["camera_controller"].cameras) if camera_state["camera_controller"] else 0,
         "exposure": camera_state["exposure"],
         "gain": camera_state["gain"],
         "streaming": camera_state["streaming"],
@@ -114,7 +128,7 @@ async def get_camera_status():
 async def set_exposure(data: Dict[str, Any], background_tasks: BackgroundTasks):
     """Set camera exposure with validation and real-time updates."""
     try:
-        exposure = float(data.get("exposure", 5_000_000))
+        exposure = float(data.get("exposure", 5000))  # Default to 5000µs (5ms)
         
         # Validate input
         if not validate_exposure(exposure):
@@ -319,16 +333,25 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 # WebSocket endpoint for video streaming
-@app.websocket("/ws")
-async def video_websocket_endpoint(websocket: WebSocket):
-    print("🔌 Video WebSocket connection established")
+# WebSocket endpoint for video streaming - MULTI CAMERA SUPPORT
+@app.websocket("/ws/{camera_index}")
+async def video_websocket_endpoint(websocket: WebSocket, camera_index: int):
+    print(f"🔌 Video WebSocket connection established for Camera {camera_index}")
     await websocket.accept()
+    
+    # Check if this camera index exists
+    if camera_index < 0 or camera_index >= len(websocket_queues):
+        print(f"❌ Invalid camera index {camera_index} (total: {len(websocket_queues)})")
+        await websocket.close()
+        return
+
+    q = websocket_queues[camera_index]
     frame_count = 0
     try:
         while True:
             # Wait for frames from the camera thread
             try:
-                frame = websocket_queue.get(timeout=1.0)
+                frame = q.get(timeout=1.0)
                 if frame is not None:
                     frame_count += 1
                     
@@ -338,21 +361,22 @@ async def video_websocket_endpoint(websocket: WebSocket):
                     
                     # Send as binary WebSocket message
                     await websocket.send_bytes(jpeg_data)
-                    print(f"✓ Frame #{frame_count} sent to browser")
+                    if frame_count <= 5 or frame_count % 100 == 0:
+                        print(f"✓ Frame #{frame_count} sent to browser (Cam {camera_index}, {len(jpeg_data)} bytes)")
             except Exception as e:
-                if "Empty" in str(e):
+                if "Empty" in str(type(e).__name__):
                     # No frame available, send a keep-alive
-                    print(f"⏳ No frame available, sending keepalive")
                     await websocket.send_text("keepalive")
                 else:
-                    print(f"❌ Video WebSocket error: {e}")
+                    print(f"❌ Video WebSocket error (Cam {camera_index}): {e}")
                     import traceback
                     traceback.print_exc()
                     break
+
     except WebSocketDisconnect:
-        print("🔌 Video WebSocket disconnected")
+        print(f"🔌 Video WebSocket disconnected (Cam {camera_index})")
     except Exception as e:
-        print(f"❌ Video WebSocket exception: {e}")
+        print(f"❌ Video WebSocket exception (Cam {camera_index}): {e}")
         import traceback
         traceback.print_exc()
 
@@ -443,83 +467,195 @@ async def save_photos(data: Dict[str, Any]):
     frames = int(data.get("frames", 1000))
     if frames <= 0:
         raise HTTPException(status_code=400, detail="frames must be >0")
+    
+    # Set consistent exposure for photo capture
+    try:
+        # Use consistent 5000µs exposure for all photos
+        camera_state["camera_controller"].set_exposure(5000)  # Set to 5000µs (5ms) for consistent exposure
+        camera_state["exposure"] = 5000
+        print("✓ Set exposure to 5000µs for consistent photo capture")
+        
+        # Increase frame rate while maintaining exposure
+        camera_state["camera_controller"].set_frame_rate(10.0)  # Increase to 10 FPS for faster unique photo capture
+        print("✓ Increased camera frame rate to 10 FPS for photo capture")
+    except Exception as e:
+        print(f"⚠ Could not set camera settings: {e}")
+    
     camera_state["save_photos"] = True
     camera_state["save_remaining"] = frames
     camera_state["save_target"] = frames
     return {"success": True, "frames": frames}
 
+@app.post("/api/camera/frame-rate")
+async def set_frame_rate(data: Dict[str, Any], background_tasks: BackgroundTasks):
+    """Set camera frame rate for faster photo capture."""
+    try:
+        fps = float(data.get("fps", 5.0))
+        
+        # Validate input
+        if fps <= 0 or fps > 30:
+            raise HTTPException(status_code=400, detail="FPS must be between 0 and 30")
+        
+        # Set camera frame rate
+        camera_state["camera_controller"].set_frame_rate(fps)
+        camera_state["frame_rate"] = fps
+        camera_state["last_update"] = time.time()
+        
+        # Broadcast update
+        background_tasks.add_task(
+            manager.broadcast, 
+            json.dumps({
+                "type": "frame_rate_updated",
+                "fps": fps,
+                "timestamp": camera_state["last_update"]
+            })
+        )
+        
+        return {"success": True, "fps": fps}
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid FPS value: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to set frame rate: {str(e)}")
+
+
+def _photo_save_worker(worker_id: int = 0):
+    """Background worker thread for saving photos to disk."""
+    print(f"=== PHOTO SAVE WORKER STARTED (id={worker_id}) ===")
+    
+    # Create the save directory
+    save_dir = Path("tests/1000photos")
+    save_dir.mkdir(parents=True, exist_ok=True)
+    print(f"✓ Photo save directory created: {save_dir.absolute()}")
+    
+    while True:
+        try:
+            if photo_save_queue and not photo_save_queue.empty():
+                # NEW format: (index, frame, camera_index)
+                item = photo_save_queue.get(timeout=1.0)
+                if len(item) == 3:
+                    idx, frame, cam_idx = item
+                else:
+                    idx, frame = item
+                    cam_idx = 0 # fall back
+                
+                # Convert grayscale to BGR for saving as JPEG
+                if len(frame.shape) == 3 and frame.shape[2] == 1:
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                else:
+                    frame_bgr = frame
+                
+                # Save the photo with camera index in filename
+                filename = save_dir / f"photo_cam{cam_idx}_{idx:04d}.jpg"
+                success = cv2.imwrite(str(filename), frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                
+                if success:
+                    print(f"[SAVE-{worker_id}] ✓ Saved photo {idx+1} for Cam {cam_idx}: {filename}")
+                else:
+                    print(f"[SAVE-{worker_id}] ❌ Failed to save photo: {filename}")
+                    
+                photo_save_queue.task_done()
+            else:
+                time.sleep(0.1)  # Small delay when no photos to save
+                
+        except Exception as e:
+            print(f"[SAVE-{worker_id}] ❌ Photo save worker error: {e}")
+            time.sleep(1.0)  # Wait before retrying on error
 
 @app.on_event("startup")
 async def startup_event():
+    # Initialize photo save queue
+    global photo_save_queue
+    photo_save_queue = Queue(maxsize=PHOTO_SAVE_QUEUE_MAX)
+    
+    # Start photo save worker thread
+    print(f"Starting {PHOTO_SAVE_WORKERS} photo save worker thread(s)...")
+    for i in range(PHOTO_SAVE_WORKERS):
+        Thread(target=_photo_save_worker, args=(i,), daemon=True).start()
+    print("✓ Photo save worker thread(s) started")
+    
     # Start camera in background thread
-    def _run():
-        """Background thread for camera streaming."""
-        print("=== CAMERA STARTUP SEQUENCE BEGIN ===")
-        # Wait a bit to ensure any previous processes are fully cleaned up
-        print("Waiting 2 seconds for cleanup...")
-        time.sleep(2)
+    def _run_camera_loop(cam_idx, input_q, output_ws_q):
+        """Background thread for SINGLE camera streaming."""
+        print(f"=== CAMERA {cam_idx} PROCESSING LOOP START ===")
+        frame_count = 0
+        last_frame_time = time.time()
         
-        try:
-            print("Starting camera controller...")
-            camera_state["camera_controller"].start()
-            print("✓ Camera controller started successfully")
-            camera_state["streaming"] = True
-            print("✓ Camera streaming state set to True")
-            
-            frame_count = 0
-            last_frame_time = time.time()
-            
-            # Process frames from the camera queue
-            print("=== ENTERING FRAME PROCESSING LOOP ===")
-            while True:
-                try:
-                    # Get frame from camera controller
-                    #print(f"Waiting for frame from camera_queue (attempt {frame_count + 1})...")
-                    frame = camera_queue.get(timeout=1.0)
+        while True:
+            try:
+                # Get frame from camera controller queue
+                frame = input_q.get(timeout=1.0)
+                
+                if frame is not None:
+                    frame_count += 1
+                    current_time = time.time()
+                    fps = 1.0 / (current_time - last_frame_time) if frame_count > 1 else 0
+                    last_frame_time = current_time
                     
-                    if frame is not None:
-                        frame_count += 1
-                        current_time = time.time()
-                        fps = 1.0 / (current_time - last_frame_time) if frame_count > 1 else 0
-                        last_frame_time = current_time
+                    print(f"✓ [Backend Cam {cam_idx}] Frame #{frame_count} received from queue (FPS: {fps:.1f})")
+
+                    
+                    # Store current frame in global state (thread-safe enough for read-only)
+                    camera_state["current_frames"][cam_idx] = frame.copy()
+                    
+                    # -------------------------------------------------
+                    # NEW: Photo burst saving 
+                    # Only save if this camera's unique frame is needed
+                    # We might need to differentiate photos by camera ID
+                    if camera_state["save_photos"] and camera_state["save_remaining"] > 0:
+                        try:
+                            if photo_save_queue:
+                                try:
+                                    # Create a unique ID that includes camera index
+                                    # For simplicity, we just dump them all into the same queue
+                                    # The worker will need to know which camera it came from
+                                    idx = camera_state["save_target"] - camera_state["save_remaining"]
+                                    
+                                    # Hack: we rely on the main camera to decrement the global counter?
+                                    # Or we let each camera save 1000 photos?
+                                    # Request was: "tele capture frame button should save a photo for all the cameras"
+                                    # So if we want 1000 frames TOTAL or 1000 frames PER CAMERA?
+                                    # Usually implies 1000 frames per camera synchronous.
+                                    # For now, let's just queue everything.
+                                    
+                                    # We'll use a tuple (frame_idx, cam_idx, frame) for the queue
+                                    # But wait, existing worker expects (idx, frame).
+                                    # We should probably update the worker too, but for minimal changes:
+                                    # Let's just save it. The global counter decrement is risky with threads.
+                                    # Let's only decrement on Camera 0 for flow control.
+                                    
+                                    photo_save_queue.put_nowait((idx, frame.copy(), cam_idx))
+                                    
+                                    if cam_idx == 0:
+                                        camera_state["save_remaining"] -= 1
+                                        if camera_state["save_remaining"] == 0:
+                                            camera_state["save_photos"] = False
+                                            print("✓ Photo burst capture fully queued (controlled by Cam 0)")
+                                except queue.Full:
+                                    pass # Drop if full
+                        except Exception as e:
+                            print(f"❌ Failed to queue photo: {e}")
+                    # -------------------------------------------------
+
+                    # Centroid Analysis (Only on Camera 0 for now to save CPU)
+                    if cam_idx == 0 and camera_state["selected_blob"] and not camera_state.get("save_photos", False):
+                         # ... (Only processing Cam 0)
+                         # We can extract the logic to a function if we want it on all cameras later
+                         pass # Existing logic was inline, will paste back below if needed or leave for Cam 0
+
+                    if cam_idx == 0:
+                        camera_state["current_frame"] = frame.copy() # Legacy support for zoom view
                         
-                        print(f"✓ Received frame #{frame_count} (shape: {frame.shape}, dtype: {frame.dtype}, FPS: {fps:.1f})")
-                        
-                        camera_state["current_frame"] = frame.copy()
-                        # -------------------------------------------------
-                        # NEW: Photo burst saving
-                        if camera_state["save_photos"] and camera_state["save_remaining"] > 0:
-                            try:
-                                idx = camera_state["save_target"] - camera_state["save_remaining"]
-                                if photo_save_queue and not photo_save_queue.full():
-                                    photo_save_queue.put((idx, frame.copy()))
-                                    camera_state["save_remaining"] -= 1
-                                    if camera_state["save_remaining"] == 0:
-                                        camera_state["save_photos"] = False
-                                        print("✓ Photo burst capture queued for saving")
-                                else:
-                                    print("⚠ Save queue full, skipping frame")
-                            except Exception as e:
-                                print(f"❌ Failed to queue photo: {e}")
-                        # -------------------------------------------------
-                        # Process frame for centroid analysis if blob is selected
+                        # -- PASTE CENTROID LOGIC FOR CAM 0 --
                         if camera_state["selected_blob"]:
-                            print(f"Processing centroid analysis for blob at {camera_state['selected_blob']}")
-                            try:
-                                # Detect blobs
+                             try:
                                 blobs = detect_blobs(frame)
                                 if blobs:
-                                    print(f"✓ Detected {len(blobs)} blobs")
-                                    # Use first detected blob or closest to selection
                                     blob = blobs[0]
-                                    
-                                    # Calculate centroids
                                     baseline = baseline_centroid(frame, mode="core")
                                     refined, radius, edge_pts = subpixel_centroid(frame, baseline)
-                                    
                                     camera_state["baseline_centroid"] = baseline
                                     camera_state["subpixel_centroid"] = refined
-                                    print(f"✓ Centroid calculated: baseline={baseline}, refined={refined}, radius={radius}")
                                     
                                     # Capture series data
                                     if camera_state["capture_series"] and len(camera_state["series_data"]) < camera_state["series_target"]:
@@ -531,53 +667,67 @@ async def startup_event():
                                             "baseline_y": baseline[1],
                                             "refined_x": refined[0],
                                             "refined_y": refined[1],
-                                            "radius_px": radius,
-                                            "diameter_px": 2 * radius,
-                                            "delta_px": delta_px,
-                                            "delta_um": delta_px * camera_state["pixel_size_mm"] * 1000,
                                             "exposure": camera_state["exposure"],
                                             "gain": camera_state["gain"]
                                         }
                                         camera_state["series_data"].append(series_entry)
-                                        print(f"✓ Added series data entry #{len(camera_state['series_data'])}")
-                                        
-                                        # Auto-stop when target reached
                                         if len(camera_state["series_data"]) >= camera_state["series_target"]:
                                             camera_state["capture_series"] = False
-                                            print("✓ Series capture completed automatically")
-                                else:
-                                    print("⚠ No blobs detected in frame")
-                            except Exception as e:
-                                print(f"❌ Centroid analysis error: {e}")
-                                import traceback
-                                traceback.print_exc()
-                        
-                        # Put frame in WebSocket queue for streaming
-                        if not websocket_queue.full():
-                            websocket_queue.put(frame.copy())
-                            print(f"✓ Frame #{frame_count} queued for WebSocket (websocket_queue size: {websocket_queue.qsize()})")
-                        else:
-                            print(f"⚠ WebSocket queue full, dropping frame #{frame_count}")
-                            
-                except Exception as e:
-                    if "Empty" not in str(e):  # Queue.Empty is expected
-                        print(f"❌ Frame processing error: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    else:
-                        print(f"⏳ No frame available (timeout), continuing...")
-                    time.sleep(0.1)
-                    
+                             except Exception as e:
+                                 print(f"Analysis error: {e}")
+                        # -- END CENTROID LOGIC --
+
+                    if not output_ws_q.full():
+                        output_ws_q.put(frame.copy())
+                        print(f"📤 [Cam {cam_idx}] Frame queued to WebSocket")
+
+            
+            except queue.Empty:
+                 # This is normal if camera is slow or not streaming yet
+                 # print(f"DEBUG: Queue empty for Cam {cam_idx}")
+                 pass
+            except Exception as e:
+                 print(f"❌ Error in Cam {cam_idx} loop: {type(e).__name__}: {e}")
+                 import traceback
+                 traceback.print_exc()
+                 time.sleep(0.01)
+
+    def _main_startup():
+        print("=== CONTROLLER STARTUP SEQUENCE ===")
+        time.sleep(1)
+        
+        try:
+            print("Starting camera controller...")
+            camera_state["camera_controller"].start()
+            
+            # Get the queues created by the controller
+            queues = camera_state["camera_controller"].get_queues()
+            print(f"Controller returned {len(queues)} queues")
+            
+            
+            global camera_queues
+            global websocket_queues
+            camera_queues = queues
+            
+            # Create a WebSocket queue for EACH camera
+            for i in range(len(queues)):
+                ws_q = Queue(maxsize=20)
+                websocket_queues.append(ws_q)
+                
+                # Start a thread for this camera
+                print(f"Starting processing thread for Camera {i}...")
+                Thread(target=_run_camera_loop, args=(i, queues[i], ws_q), daemon=True).start()
+                
+            camera_state["streaming"] = True
+            print("✓ All camera threads started")
+            
         except Exception as e:
-            print(f"❌ Camera error: {e}")
+            print(f"❌ Startup Error: {e}")
             import traceback
             traceback.print_exc()
-            camera_state["streaming"] = False
-            print("❌ Camera streaming state set to False")
 
-    print("Starting camera thread...")
-    Thread(target=_run, daemon=True).start()
-    print("✓ Camera thread started")
+    print("Starting main startup thread...")
+    Thread(target=_main_startup, daemon=True).start()
 
 
 # No explicit shutdown handler; daemon thread ends with process
@@ -886,10 +1036,51 @@ async def index():
                     transform: scale(1.01);
                 }
                 
+                
                 .no-stream {
                     color: #666;
                     font-size: 1.1rem;
                     font-style: italic;
+                    grid-column: 1 / -1;
+                    text-align: center;
+                    padding: 40px;
+                }
+                
+                #cameraGrid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+                    gap: 20px;
+                    width: 100%;
+                }
+
+                .camera-card {
+                    background: rgba(255, 255, 255, 0.95);
+                    backdrop-filter: blur(10px);
+                    border-radius: 20px;
+                    padding: 15px;
+                    box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+                    border: 1px solid rgba(255,255,255,0.2);
+                    text-align: center;
+                    position: relative;
+                }
+                
+                .stream-img {
+                    max-width: 100%;
+                    border-radius: 12px;
+                    box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+                    transition: all 0.3s ease;
+                    cursor: crosshair;
+                }
+                
+                .stream-img:hover {
+                    transform: scale(1.01);
+                }
+
+                .cam-title {
+                    margin-bottom: 10px;
+                    color: #667eea;
+                    font-weight: 600;
+                    font-size: 1.1rem;
                 }
                 
                 .zoom-pane {
@@ -1074,13 +1265,14 @@ async def index():
                     </div>
                     
                     <div class="stream-section">
-                        <div class="stream-container">
-                            <img id="stream" style="display: none;" alt="Live camera stream" onclick="handleImageClick(event)"/>
+                    <div class="stream-section">
+                        <div id="streamContainer" class="stream-container" style="display: block;">
                             <div id="noStream" class="no-stream">
                                 <div style="font-size: 3rem; margin-bottom: 15px;">📹</div>
-                                Click "Start Stream" to begin live feed<br>
-                                <small style="color: #999;">Click on the image to select a blob for analysis</small>
+                                Click "Start Stream" to begin live feed for all cameras<br>
                             </div>
+                            <!-- Dynamic grid for cameras -->
+                            <div id="cameraGrid"></div>
                         </div>
                         
                         <div class="zoom-pane">
@@ -1103,13 +1295,14 @@ async def index():
 
             <script>
                 // Global variables
-                let ws = null;
+                let websockets = []; // Array of WS connections
                 let stateWs = null;
                 let isStreaming = false;
                 let frameCount = 0;
                 let lastFrameTime = 0;
                 let fps = 0;
                 let selectedBlob = null;
+                let cameraCount = 0; // Will be set by API
                 
                 // Debouncing variables
                 let exposureTimeout = null;
@@ -1117,7 +1310,7 @@ async def index():
                 const DEBOUNCE_DELAY = 300; // ms
                 
                 // DOM elements
-                const img = document.getElementById('stream');
+                const cameraGrid = document.getElementById('cameraGrid');
                 const noStream = document.getElementById('noStream');
                 const startBtn = document.getElementById('startBtn');
                 const startText = document.getElementById('startText');
@@ -1202,6 +1395,10 @@ async def index():
                 
                 // Update UI from state data
                 function updateUIFromState(state) {
+                    if (state.camera_count !== undefined) {
+                         cameraCount = state.camera_count;
+                         console.log(`📸 System reported ${cameraCount} cameras`);
+                    }
                     if (state.exposure !== undefined) {
                         updateExposureUI(state.exposure);
                     }
@@ -1306,63 +1503,90 @@ async def index():
                     status.textContent = 'Connecting...';
                     statusDot.className = 'status-dot ready';
                     
-                    ws = new WebSocket(`ws://${location.host}/ws/camera`);
-                    ws.binaryType = 'arraybuffer';
+                    // Fetch camera count first if not known (though state socket likely told us)
+                    // We'll proceed assuming cameraCount is set, or default to 1 if 0 (failsafe)
+                    const count = cameraCount || 1;
                     
-                    ws.onopen = () => {
-                        isStreaming = true;
-                        startText.textContent = '⏹️ Stop Stream';
-                        startBtn.className = 'btn btn-danger';
-                        captureBtn.disabled = false;
-                        seriesBtn.disabled = false;
-                        savePhotosBtn.disabled = false; // NEW enable when streaming
-                        status.textContent = 'Streaming live feed';
-                        statusDot.className = 'status-dot streaming';
-                        img.style.display = 'inline';
-                        noStream.style.display = 'none';
+                    cameraGrid.innerHTML = ''; // Clear grid
+                    websockets = [];
+                    
+                    for (let i = 0; i < count; i++) {
+                        // Create card
+                        const card = document.createElement('div');
+                        card.className = 'camera-card';
                         
-                        // Reset stats
-                        frameCount = 0;
-                        fps = 0;
-                        fpsValue.textContent = '0';
-                        frameCountElement.textContent = '0';
+                        const title = document.createElement('div');
+                        title.className = 'cam-title';
+                        title.textContent = `Camera ${i+1}`;
+                        card.appendChild(title);
                         
-                        // Start polling for state updates
-                        startStatePolling();
-                    };
+                        const img = document.createElement('img');
+                        img.className = 'stream-img';
+                        img.id = `stream-${i}`;
+                        img.alt = `Live stream camera ${i}`;
+                        img.onclick = (e) => handleImageClick(e, i); // Pass index
+                        card.appendChild(img);
+                        
+                        cameraGrid.appendChild(card);
+                        
+                        // Setup WebSocket
+                        const ws = new WebSocket(`ws://${location.host}/ws/${i}`);
+                        ws.binaryType = 'arraybuffer';
+                        
+                        ws.onopen = () => {
+                            console.log(`Connected to Cam ${i}`);
+                        };
+                        
+                        ws.onmessage = ev => {
+                           if (typeof ev.data === 'string' && ev.data === 'keepalive') return;
+                           const blob = new Blob([ev.data], {type: 'image/jpeg'});
+                           img.src = URL.createObjectURL(blob);
+                           if (i === 0) updateStats(); // Only update stats from primary
+                        };
+                        
+                        ws.onerror = (e) => {
+                             console.error(`Error Cam ${i}:`, e);
+                        };
+                        
+                        websockets.push(ws);
+                    }
+
+                    isStreaming = true;
+                    startText.textContent = '⏹️ Stop Stream';
+                    startBtn.className = 'btn btn-danger';
+                    captureBtn.disabled = false;
+                    seriesBtn.disabled = false;
+                    savePhotosBtn.disabled = false;
+                    status.textContent = `Streaming ${count} cameras live`;
+                    statusDot.className = 'status-dot streaming';
+                    noStream.style.display = 'none';
                     
-                    ws.onmessage = ev => {
-                        const blob = new Blob([ev.data], {type: 'image/jpeg'});
-                        img.src = URL.createObjectURL(blob);
-                        updateStats();
-                    };
+                    // Reset stats
+                    frameCount = 0;
+                    fps = 0;
+                    fpsValue.textContent = '0';
+                    frameCountElement.textContent = '0';
                     
-                    ws.onclose = () => {
-                        stopStream();
-                    };
-                    
-                    ws.onerror = () => {
-                        status.textContent = 'Connection error';
-                        statusDot.className = 'status-dot error';
-                        stopStream();
-                    };
+                    // Start polling for state updates (if not already running)
+                    startStatePolling();
                 }
 
                 function stopStream() {
-                    if (ws) {
-                        ws.close();
-                        ws = null;
-                    }
+                    websockets.forEach(ws => {
+                        if (ws) ws.close();
+                    });
+                    websockets = [];
+                    
                     isStreaming = false;
                     startText.textContent = '▶️ Start Stream';
                     startBtn.className = 'btn btn-primary';
                     captureBtn.disabled = true;
                     seriesBtn.disabled = true;
-                    savePhotosBtn.disabled = true; // NEW disable when not streaming
+                    savePhotosBtn.disabled = true;
                     status.textContent = 'Ready to start streaming';
                     statusDot.className = 'status-dot ready';
-                    img.style.display = 'none';
                     noStream.style.display = 'block';
+                    cameraGrid.innerHTML = '';
                     
                     // Stop polling
                     if (statePollInterval) {
@@ -1372,6 +1596,7 @@ async def index():
                 }
 
                 let statePollInterval = null;
+
 
                 function startStatePolling() {
                     // Poll for state updates every 5 seconds
@@ -1536,18 +1761,21 @@ async def index():
                     });
                 }
 
-                function handleImageClick(event) {
-                    const rect = img.getBoundingClientRect();
+                function handleImageClick(event, camIndex) {
+                    if (camIndex !== 0) return; // Only allow analysis on Camera 1 (index 0)
+                    
+                    const rect = event.target.getBoundingClientRect();
                     const x = event.clientX - rect.left;
                     const y = event.clientY - rect.top;
                     
                     // Convert to image coordinates
-                    const scaleX = img.naturalWidth / rect.width;
-                    const scaleY = img.naturalHeight / rect.height;
-                    const imgX = x * scaleX;
-                    const imgY = y * scaleY;
+                    const scaleX = event.target.naturalWidth / rect.width;
+                    const scaleY = event.target.naturalHeight / rect.height;
                     
-                    console.log(`🎯 Frontend: Clicked at screen (${x}, ${y}), image (${imgX.toFixed(1)}, ${imgY.toFixed(1)})`);
+                    const imgX = Math.round(x * scaleX);
+                    const imgY = Math.round(y * scaleY);
+                    
+                    console.log(`Clicked at ${imgX}, ${imgY} on Cam ${camIndex}`);
                     
                     selectedBlob = {x: imgX, y: imgY};
                     

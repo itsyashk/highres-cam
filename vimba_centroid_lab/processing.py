@@ -103,7 +103,11 @@ def subpixel_centroid(
     if np.isnan(cx0):
         return (np.nan, np.nan), np.nan, np.empty((0, 2))
 
-    h, w = img.shape
+    # Handle both grayscale and color images
+    if len(img.shape) == 3:
+        h, w = img.shape[:2]
+    else:
+        h, w = img.shape
     # Rough radius estimate if none provided (fallback to 1/4 of min dim)
     if initial_radius_px is None:
         # Use low threshold to include blurred edge
@@ -115,7 +119,11 @@ def subpixel_centroid(
             initial_radius_px = min(h, w) / 4
 
     # Intensities for inside/background to compute I50
-    yy, xx = np.indices(img.shape)
+    # Use only height and width for indices, not channels
+    if len(img.shape) == 3:
+        yy, xx = np.indices(img.shape[:2])
+    else:
+        yy, xx = np.indices(img.shape)
     dist = np.hypot(xx - cx0, yy - cy0)
     inside_vals = img[(dist < initial_radius_px * 0.5) & (img < 250)]
     bg_vals = img[(dist > initial_radius_px * 1.2)]
