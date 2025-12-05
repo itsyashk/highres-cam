@@ -1195,12 +1195,9 @@ async def index():
                     <div class="control-panel">
                         <div class="control-section">
                             <h3>🎮 Stream Controls</h3>
-                            <button id="startBtn1" class="btn btn-primary" onclick="toggleCamera(0)">
-                                <span id="startText1">▶️ Start Camera 1</span>
-                            </button>
-                            <button id="startBtn2" class="btn btn-primary" onclick="toggleCamera(1)">
-                                <span id="startText2">▶️ Start Camera 2</span>
-                            </button>
+                            <!-- Dynamic Camera Controls -->
+                            <div id="cameraControls"></div>
+
                             <button id="captureBtn" class="btn btn-secondary" onclick="captureFrame()" disabled>
                                 📸 Capture Frame
                             </button>
@@ -1339,13 +1336,10 @@ async def index():
                 // DOM elements
                 const cameraGrid = document.getElementById('cameraGrid');
                 const noStream = document.getElementById('noStream');
-                const startBtn1 = document.getElementById('startBtn1');
-                const startBtn2 = document.getElementById('startBtn2');
-                const startText1 = document.getElementById('startText1');
-                const startText2 = document.getElementById('startText2');
                 const captureBtn = document.getElementById('captureBtn');
 
                 const savePhotosBtn = document.getElementById('savePhotosBtn'); // NEW
+
                 const seriesBtn = document.getElementById('seriesBtn');
                 const status = document.getElementById('status');
                 const statusDot = document.getElementById('statusDot');
@@ -1522,8 +1516,46 @@ async def index():
                 }
 
                 // Track which cameras are streaming
-                let cameraStreaming = [false, false];
-                let cameraWebsockets = [null, null];
+                // Initialize as empty arrays, will be populated based on camera count
+                let cameraStreaming = [];
+                let cameraWebsockets = [];
+                
+                // Initialize controls on load
+                async function initializeCameraControls() {
+                    try {
+                        const response = await fetch('/api/camera/status');
+                        const state = await response.json();
+                        cameraCount = state.camera_count || 0;
+                        console.log(`📸 Initializing controls for ${cameraCount} cameras`);
+                        
+                        // Initialize arrays
+                        cameraStreaming = new Array(cameraCount).fill(false);
+                        cameraWebsockets = new Array(cameraCount).fill(null);
+                        
+                        const container = document.getElementById('cameraControls');
+                        container.innerHTML = ''; // Clear existing
+                        
+                        for (let i = 0; i < cameraCount; i++) {
+                            const btn = document.createElement('button');
+                            btn.id = `startBtn${i+1}`;
+                            btn.className = 'btn btn-primary';
+                            btn.onclick = () => toggleCamera(i);
+                            
+                            const span = document.createElement('span');
+                            span.id = `startText${i+1}`;
+                            span.textContent = `▶️ Start Camera ${i+1}`;
+                            
+                            btn.appendChild(span);
+                            container.appendChild(btn);
+                        }
+                    } catch (e) {
+                        console.error('Failed to initialize camera controls:', e);
+                    }
+                }
+                
+                // Call initialization when page loads
+                document.addEventListener('DOMContentLoaded', initializeCameraControls);
+
                 
                 function toggleCamera(cameraIndex) {
                     if (!cameraStreaming[cameraIndex]) {
