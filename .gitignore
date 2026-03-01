@@ -8,4 +8,5 @@ env/
 venv/
 
 # Output directory
-vimba_centroid_lab/output/ 
+vimba_centroid_lab/output/
+Vimba_documentation/ 
