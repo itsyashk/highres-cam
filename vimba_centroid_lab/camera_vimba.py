@@ -572,24 +572,34 @@ class CameraController:
             else:
                 print(f"WARNING: cam{current_camera} no frame in 0.5s timeout")
 
-            # PIPELINE: start next camera BEFORE stopping current.
-            # Next camera begins its 440ms exposure while current camera's
-            # 270ms stop_streaming() blocks — they overlap instead of stacking.
-            next_cam._frame_event.clear()
-            t_next = time.time()
-            try:
-                next_cam.start()
-                # print(f"[PIPE|cam{next_idx}|2_STREAM_START] t={time.time():.3f} start_took={time.time()-t_next:.3f}s (overlapping cam{current_camera} stop)")
-            except Exception as e:
-                print(f"ERROR: cam{next_idx} failed to start: {e}")
+            if next_idx != current_camera:
+                # PIPELINE (N≥2): start next camera BEFORE stopping current.
+                # next camera's 440ms exposure warmup overlaps current camera's
+                # 270ms stop_streaming() — saves 270ms per switch vs sequential.
+                # Per-iteration cost settles to: 170ms wait + 50ms start + 270ms stop = 490ms
+                # Total cycle = N × 490ms for any N≥2.
+                next_cam._frame_event.clear()
+                try:
+                    next_cam.start()
+                except Exception as e:
+                    print(f"ERROR: cam{next_idx} failed to start: {e}")
 
-            # Stop current camera — next camera is already exposing during this 270ms
-            t_stop = time.time()
-            try:
-                cam.stop()
-            except Exception as e:
-                print(f"ERROR: cam{current_camera} failed to stop: {e}")
-            # print(f"[PIPE|cam{current_camera}|2_STREAM_STOP] t={time.time():.3f} stop_took={time.time()-t_stop:.3f}s")
+                try:
+                    cam.stop()
+                except Exception as e:
+                    print(f"ERROR: cam{current_camera} failed to stop: {e}")
+            else:
+                # N=1: only one camera — stop then restart (pipeline doesn't apply,
+                # next_idx == current_camera so we can't start before stopping)
+                try:
+                    cam.stop()
+                except Exception as e:
+                    print(f"ERROR: cam{current_camera} failed to stop: {e}")
+                cam._frame_event.clear()
+                try:
+                    cam.start()
+                except Exception as e:
+                    print(f"ERROR: cam{current_camera} failed to restart: {e}")
 
             current_camera = next_idx
     
