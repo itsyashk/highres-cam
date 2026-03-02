@@ -88,7 +88,7 @@ def baseline_centroid(
         _, mask = cv2.threshold(img, thr_core, 255, cv2.THRESH_BINARY)
     else:
         _, mask = cv2.threshold(img, thr_nonblack, 255, cv2.THRESH_BINARY)
-    return centroid_from_mask(mask.astype(bool))
+    return centroid_from_mask(mask)
 
 
 def subpixel_centroid(
@@ -119,11 +119,8 @@ def subpixel_centroid(
             initial_radius_px = min(h, w) / 4
 
     # Intensities for inside/background to compute I50
-    # Use only height and width for indices, not channels
-    if len(img.shape) == 3:
-        yy, xx = np.indices(img.shape[:2])
-    else:
-        yy, xx = np.indices(img.shape)
+    yy = np.arange(h, dtype=np.float64)[:, np.newaxis]
+    xx = np.arange(w, dtype=np.float64)[np.newaxis, :]
     dist = np.hypot(xx - cx0, yy - cy0)
     inside_vals = img[(dist < initial_radius_px * 0.5) & (img < 250)]
     bg_vals = img[(dist > initial_radius_px * 1.2)]
@@ -132,6 +129,8 @@ def subpixel_centroid(
     I50 = 0.5 * (I_in + I_bg)
 
     angles = np.linspace(0, 2 * np.pi, num_rays, endpoint=False)
+    cos_angles = np.cos(angles)
+    sin_angles = np.sin(angles)
     edge_pts: List[Tuple[float, float]] = []
 
     max_r = min(h, w) / 2  # sample out to half image diagonal to ensure crossing
@@ -140,12 +139,12 @@ def subpixel_centroid(
 
     img_f32 = img.astype(np.float32)
 
-    for ang in angles:
-        xs = cx0 + r_vals * np.cos(ang)
-        ys = cy0 + r_vals * np.sin(ang)
+    for cos_ang, sin_ang in zip(cos_angles, sin_angles):
+        xs = cx0 + r_vals * cos_ang
+        ys = cy0 + r_vals * sin_ang
         vals = _bilinear_sample(img_f32, xs, ys)
         above = vals > I50
-        transitions = np.where(np.logical_and(above[:-1], ~above[1:]))[0]
+        transitions = np.where(above[:-1] & ~above[1:])[0]
         if transitions.size == 0:
             continue
         # pick transition nearest expected radius
@@ -157,8 +156,8 @@ def subpixel_centroid(
         else:
             frac = (v0 - I50) / (v0 - v1)
             r_edge = r0 + frac * (r1 - r0)
-        xe = cx0 + r_edge * np.cos(ang)
-        ye = cy0 + r_edge * np.sin(ang)
+        xe = cx0 + r_edge * cos_ang
+        ye = cy0 + r_edge * sin_ang
         edge_pts.append((xe, ye))
 
     edge_pts = np.asarray(edge_pts, dtype=np.float64)

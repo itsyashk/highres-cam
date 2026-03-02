@@ -22,6 +22,10 @@ from vimba import Vimba, FrameStatus, Camera, PixelFormat
 from .camera_vimba import CameraController
 from .processing import detect_blobs, baseline_centroid, subpixel_centroid
 
+# Pre-allocated JPEG encoding param lists — avoids a list allocation on every frame
+_JPEG_PARAMS_85 = [cv2.IMWRITE_JPEG_QUALITY, 85]
+_JPEG_PARAMS_90 = [cv2.IMWRITE_JPEG_QUALITY, 90]
+
 app = FastAPI()
 
 # Add CORS middleware
@@ -336,22 +340,15 @@ async def websocket_endpoint(websocket: WebSocket):
 # WebSocket endpoint for video streaming - MULTI CAMERA SUPPORT
 @app.websocket("/ws/{camera_index}")
 async def video_websocket_endpoint(websocket: WebSocket, camera_index: int):
-    print(f"🔌 Incoming WebSocket connection request for /ws/{camera_index}")
-    
-    # Check if queues are initialized
     if not websocket_queues:
-        print(f"❌ WebSocket error: No queues initialized yet (len={len(websocket_queues)})")
         await websocket.close()
         return
 
     if camera_index >= len(websocket_queues):
-        print(f"❌ WebSocket error: Invalid camera index {camera_index} (max {len(websocket_queues)-1})")
         await websocket.close()
         return
-        
-    print(f"🔌 Connecting WebSocket to Camera {camera_index} queue...")
+
     await websocket.accept()
-    print(f"🔌 WebSocket connection established for Camera {camera_index}")
     
     q = websocket_queues[camera_index]
     frame_count = 0
@@ -364,41 +361,42 @@ async def video_websocket_endpoint(websocket: WebSocket, camera_index: int):
                 # CRITICAL FIX: Use run_in_executor to avoid blocking the asyncio event loop
                 # The queue.Queue.get method is blocking. Running it in a thread pool allows
                 # the event loop to continue processing other requests (like new WebSocket connections)
+                t_ws_dequeue = time.time()
                 frame = await asyncio.get_event_loop().run_in_executor(
-                    None, 
-                    q.get, 
+                    None,
+                    q.get,
                     True, # block
                     0.1   # timeout (reduced to 100ms for better responsiveness)
                 )
-                
+
                 if frame is not None:
                     frame_count += 1
-                    
+                    t_got = time.time()
+                    # TRACE: frame pulled from websocket queue (t_ws_dequeue = when we started waiting)
+                    # print(f"[PIPE|cam{camera_index}|4_WS_Q→SEND] t_start_wait={t_ws_dequeue:.3f} t_got={t_got:.3f} waited={t_got-t_ws_dequeue:.3f}s frame#{frame_count}")
+
                     # Convert to JPEG
-                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    t_enc_start = time.time()
+                    _, buffer = cv2.imencode('.jpg', frame, _JPEG_PARAMS_85)
                     jpeg_data = buffer.tobytes()
-                    
+                    t_enc_end = time.time()
+
                     # Send as binary WebSocket message
                     await websocket.send_bytes(jpeg_data)
-                    if frame_count <= 5 or frame_count % 100 == 0:
-                        print(f"✓ Frame #{frame_count} sent to browser (Cam {camera_index}, {len(jpeg_data)} bytes)")
+                    t_sent = time.time()
+                    # TRACE: frame encoded and sent to browser
+                    # print(f"[PIPE|cam{camera_index}|4_SENT] t={t_sent:.3f} encode={t_enc_end-t_enc_start:.3f}s send={t_sent-t_enc_end:.3f}s size_kb={len(jpeg_data)//1024}")
             except Exception as e:
-                # Handle Empty queue which raises directly or wrapped in execution error
                 if "Empty" in str(type(e).__name__) or "Empty" in str(e):
-                    # No frame available, send a keep-alive
                     await websocket.send_text("keepalive")
                 else:
-                    print(f"❌ Video WebSocket error (Cam {camera_index}): {e}")
-                    import traceback
-                    traceback.print_exc()
+                    print(f"ERROR: Video WebSocket (Cam {camera_index}): {e}")
                     break
 
     except WebSocketDisconnect:
-        print(f"🔌 Video WebSocket disconnected (Cam {camera_index})")
+        pass
     except Exception as e:
-        print(f"❌ Video WebSocket exception (Cam {camera_index}): {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"ERROR: Video WebSocket exception (Cam {camera_index}): {e}")
 
 
 @app.post("/api/capture-series")
@@ -442,7 +440,6 @@ async def calibrate_scale(data: Dict[str, Any]):
 @app.post("/api/select-blob")
 async def select_blob(data: Dict[str, Any]):
     x, y = data.get("x", 0), data.get("y", 0)
-    print(f"🎯 BLOB SELECTED: x={x}, y={y}")
     camera_state["selected_blob"] = (x, y)
     return {"success": True, "selected": (x, y)}
 
@@ -470,15 +467,12 @@ async def get_zoom_view():
         roi = frame[y1:y2, x1:x2]
         
         # Encode to JPEG
-        _, buffer = cv2.imencode('.jpg', roi, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        _, buffer = cv2.imencode('.jpg', roi, _JPEG_PARAMS_90)
         jpeg_data = buffer.tobytes()
         
-        print(f"🔍 ZOOM VIEW: ROI extracted at ({x1},{y1}) to ({x2},{y2}), size: {roi.shape}")
-        
         return HTMLResponse(content=jpeg_data, media_type="image/jpeg")
-        
+
     except Exception as e:
-        print(f"❌ ZOOM VIEW ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/save-photos")  # NEW ENDPOINT
@@ -491,15 +485,11 @@ async def save_photos(data: Dict[str, Any]):
     # Set consistent exposure for photo capture
     try:
         # Use consistent 5000µs exposure for all photos
-        camera_state["camera_controller"].set_exposure(5000)  # Set to 5000µs (5ms) for consistent exposure
+        camera_state["camera_controller"].set_exposure(5000)
         camera_state["exposure"] = 5000
-        print("✓ Set exposure to 5000µs for consistent photo capture")
-        
-        # Increase frame rate while maintaining exposure
-        camera_state["camera_controller"].set_frame_rate(10.0)  # Increase to 10 FPS for faster unique photo capture
-        print("✓ Increased camera frame rate to 10 FPS for photo capture")
+        camera_state["camera_controller"].set_frame_rate(10.0)
     except Exception as e:
-        print(f"⚠ Could not set camera settings: {e}")
+        print(f"WARNING: Could not set camera settings for photo capture: {e}")
     
     camera_state["save_photos"] = True
     camera_state["save_remaining"] = frames
@@ -541,46 +531,36 @@ async def set_frame_rate(data: Dict[str, Any], background_tasks: BackgroundTasks
 
 def _photo_save_worker(worker_id: int = 0):
     """Background worker thread for saving photos to disk."""
-    print(f"=== PHOTO SAVE WORKER STARTED (id={worker_id}) ===")
-    
-    # Create the save directory
     save_dir = Path("tests/1000photos")
     save_dir.mkdir(parents=True, exist_ok=True)
-    print(f"✓ Photo save directory created: {save_dir.absolute()}")
-    
+
     while True:
         try:
             if photo_save_queue and not photo_save_queue.empty():
-                # NEW format: (index, frame, camera_index)
                 item = photo_save_queue.get(timeout=1.0)
                 if len(item) == 3:
                     idx, frame, cam_idx = item
                 else:
                     idx, frame = item
-                    cam_idx = 0 # fall back
-                
-                # Convert grayscale to BGR for saving as JPEG
+                    cam_idx = 0
+
                 if len(frame.shape) == 3 and frame.shape[2] == 1:
                     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
                 else:
                     frame_bgr = frame
-                
-                # Save the photo with camera index in filename
+
                 filename = save_dir / f"photo_cam{cam_idx}_{idx:04d}.jpg"
-                success = cv2.imwrite(str(filename), frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                
-                if success:
-                    print(f"[SAVE-{worker_id}] ✓ Saved photo {idx+1} for Cam {cam_idx}: {filename}")
-                else:
-                    print(f"[SAVE-{worker_id}] ❌ Failed to save photo: {filename}")
-                    
+                success = cv2.imwrite(str(filename), frame_bgr, _JPEG_PARAMS_85)
+                if not success:
+                    print(f"ERROR: [SAVE-{worker_id}] Failed to write {filename}")
+
                 photo_save_queue.task_done()
             else:
-                time.sleep(0.1)  # Small delay when no photos to save
-                
+                time.sleep(0.1)
+
         except Exception as e:
-            print(f"[SAVE-{worker_id}] ❌ Photo save worker error: {e}")
-            time.sleep(1.0)  # Wait before retrying on error
+            print(f"ERROR: [SAVE-{worker_id}] Photo save worker: {e}")
+            time.sleep(1.0)
 
 @app.on_event("startup")
 async def startup_event():
@@ -589,15 +569,12 @@ async def startup_event():
     photo_save_queue = Queue(maxsize=PHOTO_SAVE_QUEUE_MAX)
     
     # Start photo save worker thread
-    print(f"Starting {PHOTO_SAVE_WORKERS} photo save worker thread(s)...")
     for i in range(PHOTO_SAVE_WORKERS):
         Thread(target=_photo_save_worker, args=(i,), daemon=True).start()
-    print("✓ Photo save worker thread(s) started")
     
     # Start camera in background thread
     def _run_camera_loop(cam_idx, input_q, output_ws_q):
         """Background thread for SINGLE camera streaming."""
-        print(f"=== CAMERA {cam_idx} PROCESSING LOOP START ===")
         frame_count = 0
         last_frame_time = time.time()
         
@@ -605,18 +582,18 @@ async def startup_event():
             try:
                 # Get frame from camera controller queue
                 frame = input_q.get(timeout=1.0)
-                
+
                 if frame is not None:
                     frame_count += 1
-                    current_time = time.time()
-                    fps = 1.0 / (current_time - last_frame_time) if frame_count > 1 else 0
-                    last_frame_time = current_time
-                    
-                    print(f"✓ [Backend Cam {cam_idx}] Frame #{frame_count} received from queue (FPS: {fps:.1f})")
+                    t_dequeue = time.time()
+                    fps = 1.0 / (t_dequeue - last_frame_time) if frame_count > 1 else 0
+                    last_frame_time = t_dequeue
+                    # TRACE: frame pulled from camera queue into processing thread
+                    # print(f"[PIPE|cam{cam_idx}|3_CAM_Q→PROC] t={t_dequeue:.3f} frame#{frame_count} fps={fps:.1f}")
 
-                    
+
                     # Store current frame in global state (thread-safe enough for read-only)
-                    camera_state["current_frames"][cam_idx] = frame.copy()
+                    camera_state["current_frames"][cam_idx] = frame
                     
                     # -------------------------------------------------
                     # NEW: Photo burst saving 
@@ -650,11 +627,10 @@ async def startup_event():
                                         camera_state["save_remaining"] -= 1
                                         if camera_state["save_remaining"] == 0:
                                             camera_state["save_photos"] = False
-                                            print("✓ Photo burst capture fully queued (controlled by Cam 0)")
                                 except queue.Full:
                                     pass # Drop if full
                         except Exception as e:
-                            print(f"❌ Failed to queue photo: {e}")
+                            print(f"ERROR: Failed to queue photo for Cam {cam_idx}: {e}")
                     # -------------------------------------------------
 
                     # Centroid Analysis (Only on Camera 0 for now to save CPU)
@@ -664,11 +640,12 @@ async def startup_event():
                          pass # Existing logic was inline, will paste back below if needed or leave for Cam 0
 
                     if cam_idx == 0:
-                        camera_state["current_frame"] = frame.copy() # Legacy support for zoom view
-                        
+                        camera_state["current_frame"] = frame  # Legacy support for zoom view
+
                         # -- PASTE CENTROID LOGIC FOR CAM 0 --
                         if camera_state["selected_blob"]:
                              try:
+                                t_centroid_start = time.time()
                                 blobs = detect_blobs(frame)
                                 if blobs:
                                     blob = blobs[0]
@@ -676,7 +653,7 @@ async def startup_event():
                                     refined, radius, edge_pts = subpixel_centroid(frame, baseline)
                                     camera_state["baseline_centroid"] = baseline
                                     camera_state["subpixel_centroid"] = refined
-                                    
+
                                     # Capture series data
                                     if camera_state["capture_series"] and len(camera_state["series_data"]) < camera_state["series_target"]:
                                         delta_px = np.hypot(refined[0] - baseline[0], refined[1] - baseline[1])
@@ -693,13 +670,24 @@ async def startup_event():
                                         camera_state["series_data"].append(series_entry)
                                         if len(camera_state["series_data"]) >= camera_state["series_target"]:
                                             camera_state["capture_series"] = False
+                                # TRACE: centroid analysis cost
+                                # print(f"[PIPE|cam{cam_idx}|3_CENTROID] t={time.time():.3f} took={time.time()-t_centroid_start:.3f}s blobs={'yes' if blobs else 'no'}")
                              except Exception as e:
                                  print(f"Analysis error: {e}")
                         # -- END CENTROID LOGIC --
 
-                    if not output_ws_q.full():
-                        output_ws_q.put(frame.copy())
-                        print(f"📤 [Cam {cam_idx}] Frame queued to WebSocket")
+                    # Drain stale frames so only the latest is ever queued
+                    ws_q_drained = 0
+                    while not output_ws_q.empty():
+                        try:
+                            output_ws_q.get_nowait()
+                            ws_q_drained += 1
+                        except Exception:
+                            break
+                    output_ws_q.put(frame)
+                    t_ws_enqueue = time.time()
+                    # TRACE: frame handed off to websocket queue
+                    # print(f"[PIPE|cam{cam_idx}|3_PROC→WS_Q] t={t_ws_enqueue:.3f} proc_total={t_ws_enqueue-t_dequeue:.3f}s ws_q_drained={ws_q_drained}")
 
             
             except queue.Empty:
@@ -707,49 +695,33 @@ async def startup_event():
                  # print(f"DEBUG: Queue empty for Cam {cam_idx}")
                  pass
             except Exception as e:
-                 print(f"❌ Error in Cam {cam_idx} loop: {type(e).__name__}: {e}")
-                 import traceback
-                 traceback.print_exc()
+                 print(f"ERROR: Cam {cam_idx} loop: {type(e).__name__}: {e}")
                  time.sleep(0.01)
 
     def _main_startup():
-        print("=== CONTROLLER STARTUP SEQUENCE ===")
         time.sleep(1)
-        
-        try:
-            print("Starting camera controller in MULTIPLEXED mode...")
-            # Use time-multiplexed capture (1 frame/camera/second, staggered)
-            # This avoids packet collision by only capturing from one camera at a time
-            camera_state["camera_controller"].start_multiplexed(interval_seconds=1.0)
 
-            
-            # Get the queues created by the controller
+        try:
+            camera_state["camera_controller"].start_multiplexed()
+
             queues = camera_state["camera_controller"].get_queues()
-            print(f"Controller returned {len(queues)} queues")
-            
-            
+
             global camera_queues
             global websocket_queues
             camera_queues = queues
-            
-            # Create a WebSocket queue for EACH camera
+
             for i in range(len(queues)):
                 ws_q = Queue(maxsize=20)
                 websocket_queues.append(ws_q)
-                
-                # Start a thread for this camera
-                print(f"Starting processing thread for Camera {i}...")
                 Thread(target=_run_camera_loop, args=(i, queues[i], ws_q), daemon=True).start()
-                
+
             camera_state["streaming"] = True
-            print("✓ All camera threads started")
-            
+
         except Exception as e:
-            print(f"❌ Startup Error: {e}")
+            print(f"ERROR: Startup failed: {e}")
             import traceback
             traceback.print_exc()
 
-    print("Starting main startup thread...")
     Thread(target=_main_startup, daemon=True).start()
 
 

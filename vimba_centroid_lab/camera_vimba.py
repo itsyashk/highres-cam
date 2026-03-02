@@ -59,7 +59,8 @@ class MockCamera(BaseCamera):
         offset_x = (id(self.q) % 100) / 100.0
         x0 = int(self.width * (0.3 + 0.3 * np.sin(t * 0.7 + offset_x * 6.28)))
         y0 = int(self.height * (0.3 + 0.3 * np.cos(t * 1.1)))
-        yy, xx = np.indices((self.height, self.width))
+        yy = np.arange(self.height, dtype=np.float32)[:, np.newaxis]
+        xx = np.arange(self.width, dtype=np.float32)[np.newaxis, :]
         r = 120  # px
         dist = np.hypot(xx - x0, yy - y0)
         img = np.clip(255 * np.exp(-((dist) ** 2) / (2 * (r ** 2))), 0, 255).astype(np.float32)
@@ -108,156 +109,133 @@ class VimbaCamera(BaseCamera):
         self._vimba_ctx = None  # holds the Vimba instance context manager
         self._running = False
         self.camera_id = camera_id
+        self._gvsp_adjusted = False   # only run packet size negotiation once
+        self._frame_seq = 0            # monotonic frame counter for pipeline tracing
+        self._cam_open = False         # True after __enter__() — camera stays open between streaming cycles
+        self._frame_event = threading.Event()  # set by _on_frame so the loop doesn't race the processing thread
 
     # ------------------------------------------------------------------
     # Internal callbacks
     # ------------------------------------------------------------------
     def _on_frame(self, cam, frame):  # type: ignore
-        print(f"DEBUG: _on_frame callback called for {self.camera_id}")
         try:
             status = frame.get_status()
             if status == FrameStatus.Complete:
                 img = frame.as_numpy_ndarray()
-                print(f"📸 COMPLETE Frame received from {self.camera_id}: {img.shape}")
-                
-                if not self.q.full():
-                    self.q.put(img.copy())
-                    print(f"📦 Frame queued for {self.camera_id}")
-                else:
-                    print(f"⚠ Frame queue full for {self.camera_id}, dropping frame")
+                self._frame_seq += 1
+                # Drain stale frames so only the latest is ever queued
+                drained = 0
+                while not self.q.empty():
+                    try:
+                        self.q.get_nowait()
+                        drained += 1
+                    except Exception:
+                        break
+                self.q.put(img.copy())
+                self._frame_event.set()  # signal alternating loop without competing with processing thread
+                # TRACE: frame arrived from Vimba hardware into camera queue
+                # print(f"[PIPE|{self.camera_id[-6:]}|1_VIMBA→CAM_Q] seq={self._frame_seq} t={time.time():.3f} drained_stale={drained} q_size=1")
             else:
-
-                # Log incomplete frames with camera ID (less spammy - only first few)
+                # Log incomplete frames (throttled)
                 if not hasattr(self, '_incomplete_count'):
                     self._incomplete_count = 0
                 self._incomplete_count += 1
-                if self._incomplete_count <= 5 or self._incomplete_count % 100 == 0:
-                    print(f"⚠ [{self.camera_id}] Incomplete frame #{self._incomplete_count}: status={status}")
+                if self._incomplete_count <= 3 or self._incomplete_count % 500 == 0:
+                    print(f"WARNING: [{self.camera_id}] incomplete frames: {self._incomplete_count} (last status={status})")
 
-
-            # CRITICAL: Always queue the frame back to the camera to keep streaming alive
+            # CRITICAL: Always recycle the frame to keep streaming alive
             cam.queue_frame(frame)
-            
+
         except Exception as e:
-            print(f"❌ Frame handler error: {e}")
-            import traceback
-            traceback.print_exc()
-            # Even on error, try to recycle the frame
+            print(f"ERROR: Frame handler for {self.camera_id}: {e}")
             try:
                 cam.queue_frame(frame)
-            except:
-                print(f"❌ Failed to recycle frame after error")
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def start(self):
-        print("=== VIMBA CAMERA STARTUP ===")
-        
-        # NOTE: self._vimba_ctx must be managed by the Controller to share Vimba instance across cameras
-        # For this single camera class, we assume we are given a camera object from the controller
-        
-        if not self._cam:
-             raise RuntimeError("Camera not initialized. Controller must assign a camera instance.")
+    def open_camera(self):
+        """Open camera context and apply one-time configuration.
 
-        print(f"Opening camera {self.camera_id} (AccessMode.Full)...")
+        Called ONCE before the alternating loop starts. Keeps the camera open
+        between streaming cycles so start()/stop() only toggle streaming (~10ms)
+        instead of doing a full open/configure/close (~850ms) every cycle.
+        """
+        if self._cam_open:
+            return  # already open, nothing to do
+
+        if not self._cam:
+            raise RuntimeError("Camera not initialized. Controller must assign a camera instance.")
+
         from vimba import AccessMode  # type: ignore
+        t0 = time.time()
         try:
-            # Set access mode before entering context (as per VimbaPython API)
             self._cam.set_access_mode(AccessMode.Full)
-            
-            # Use context manager protocol which is standard for VimbaPython
-            # We manually call __enter__ to keep it open until stop() is called
             self._cam.__enter__()
-            print(f"✓ Camera {self.camera_id} opened successfully")
+            self._cam_open = True
         except Exception as e:
-            print(f"❌ Failed to open camera {self.camera_id}: {e}")
+            print(f"ERROR: Failed to open camera {self.camera_id}: {e}")
             raise
 
-        # Adjust packet size for GigE, ignore errors
-        print("Attempting to adjust GigE packet size...")
+        # GigE packet size negotiation — one-time, MTU doesn't change
         try:
             self._cam.GVSPAdjustPacketSize.run()
             while not self._cam.GVSPAdjustPacketSize.is_done():
                 pass
-            print("✓ GigE packet size adjusted")
-        except Exception as e:
-            print(f"⚠ GigE packet size adjustment failed (not a GigE camera?): {e}")
+            self._gvsp_adjusted = True
+        except Exception:
+            self._gvsp_adjusted = True
 
-        # Set Bandwidth Limit for multi-camera operation
-        # 31 MB/s is camera minimum - trying this for dual-camera stability
+        # Bandwidth limit for multi-camera GigE (31 MB/s)
         TARGET_BANDWIDTH = 31_000_000
-        print(f"Setting StreamBytesPerSecond to {TARGET_BANDWIDTH}...")
-
-
-
         try:
-            # Try setting StreamBytesPerSecond directly
             try:
-                feat = self._cam.get_feature_by_name("StreamBytesPerSecond")
-                feat.set(TARGET_BANDWIDTH)
-                print(f"✓ StreamBytesPerSecond set to {TARGET_BANDWIDTH}")
+                self._cam.get_feature_by_name("StreamBytesPerSecond").set(TARGET_BANDWIDTH)
             except Exception:
-                # Fallback to DeviceLinkThroughputLimit
-                feat = self._cam.get_feature_by_name("DeviceLinkThroughputLimit")
-                feat.set(TARGET_BANDWIDTH)
-                print(f"✓ DeviceLinkThroughputLimit set to {TARGET_BANDWIDTH}")
+                self._cam.get_feature_by_name("DeviceLinkThroughputLimit").set(TARGET_BANDWIDTH)
         except Exception as e:
-            print(f"⚠ Failed to set bandwidth limit: {e}")
+            print(f"WARNING: Could not set bandwidth limit for {self.camera_id}: {e}")
 
-        # NEW: Set Inter-Packet Delay for multi-camera GigE stability
-        # This gives the NIC time to process each packet, reducing frame loss
-        print("Setting GigE inter-packet delay (GevSCPD)...")
+        # Inter-packet delay for GigE stability
         try:
-            # GevSCPD = Stream Channel Packet Delay (in clock ticks)
-            # Higher values = slower streaming but more reliable
-            feat = self._cam.get_feature_by_name("GevSCPD")
-            feat.set(10000)  # ~10000 ticks delay
-            print(f"✓ GevSCPD set to 10000")
-        except Exception as e:
-            print(f"⚠ Failed to set GevSCPD: {e}")
-            
-        # Also try frame transmission delay if available
+            self._cam.get_feature_by_name("GevSCPD").set(10000)
+        except Exception:
+            pass
         try:
-            feat = self._cam.get_feature_by_name("GevSCFTD")
-            feat.set(100000)  # Frame transmission delay
-            print(f"✓ GevSCFTD set to 100000")
-        except Exception as e:
-            print(f"⚠ GevSCFTD not available: {e}")
+            self._cam.get_feature_by_name("GevSCFTD").set(100000)
+        except Exception:
+            pass
 
-
-
-        # Ensure Mono8 pixel format if supported by SDK/camera
-        print("Setting pixel format to Mono8 if supported...")
+        # Pixel format
         try:
-            # Prefer enum-based API when available
             from vimba import PixelFormat as PF  # type: ignore
             try:
-                self._cam.set_pixel_format(PF.Mono8)  # enum expected by some SDK versions
-                print("✓ Pixel format set to Mono8 via set_pixel_format(enum)")
-            except Exception as e1:
-                print(f"⚠ set_pixel_format(enum) failed: {e1}")
+                self._cam.set_pixel_format(PF.Mono8)
+            except Exception:
                 try:
                     feat = self._cam.get_feature_by_name('PixelFormat')
-                    # Try enum value if present in feature API
                     try:
-                        feat.set(PF.Mono8)  # some SDKs accept enum here
-                        print("✓ Pixel format set to Mono8 via feature.set(enum)")
-                    except Exception as e1b:
-                        # Fallback to string name
+                        feat.set(PF.Mono8)
+                    except Exception:
                         feat.set('Mono8')
-                        print("✓ Pixel format set to Mono8 via feature.set('Mono8')")
                 except Exception as e2:
-                    print(f"⚠ Feature API fallback failed: {e2}")
+                    print(f"WARNING: Could not set Mono8 on {self.camera_id}: {e2}")
         except Exception as e:
-            # If PF import or all attempts fail, just continue with current format
-            print(f"⚠ Could not enforce Mono8 pixel format: {e}")
-            print("⚠ Continuing with camera default pixel format")
+            print(f"WARNING: Could not enforce Mono8 pixel format on {self.camera_id}: {e}")
 
-        print(f"Starting streaming with buffer_count={self.buffer_count}...")
+        # print(f"[PIPE|{self.camera_id[-6:]}|OPEN] Camera opened and configured in {time.time()-t0:.3f}s")
+
+    def start(self):
+        """Start streaming only — camera must already be open via open_camera()."""
+        if not self._cam_open:
+            # Fallback: open on first call if open_camera() wasn't called beforehand
+            self.open_camera()
+        self._frame_event.clear()
         self._cam.start_streaming(handler=self._on_frame, buffer_count=self.buffer_count)
         self._running = True
-        print(f"✓ Camera {self.camera_id} streaming started successfully")
+        print(f"Camera {self.camera_id} streaming started")
 
     def attach_camera(self, cam_obj):
         """Attaches a Vimba Camera object found by the controller."""
@@ -265,14 +243,28 @@ class VimbaCamera(BaseCamera):
         self.camera_id = cam_obj.get_id()
 
     def stop(self):
+        """Stop streaming only — camera stays open for the next cycle."""
         if self._cam and self._running:
             try:
                 self._cam.stop_streaming()
-            except Exception: 
+            except Exception:
                 pass
-            # Exit camera context (closes)
-            self._cam.__exit__(None, None, None)
             self._running = False
+
+    def close(self):
+        """Close camera context — called at shutdown only."""
+        if self._running:
+            try:
+                self._cam.stop_streaming()
+            except Exception:
+                pass
+            self._running = False
+        if self._cam and self._cam_open:
+            try:
+                self._cam.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._cam_open = False
 
     # Detached context management from VimbaCamera to CameraController
 
@@ -281,36 +273,24 @@ class VimbaCamera(BaseCamera):
         if hasattr(self, '_cam') and self._cam:
             try:
                 self._cam.ExposureTime.set(exposure_us)
-                # Verify the setting was applied
-                actual_exposure = self._cam.ExposureTime.get()
-                print(f"✓ Set exposure to {exposure_us} µs (actual: {actual_exposure} µs)")
             except Exception as e:
-                print(f"❌ Failed to set exposure: {e}")
-                # Try alternative method
+                print(f"ERROR: [{self.camera_id}] set_exposure failed: {e}")
                 try:
-                    feat = self._cam.get_feature_by_name('ExposureTime')
-                    feat.set(exposure_us)
-                    actual_exposure = feat.get()
-                    print(f"✓ Set exposure to {exposure_us} µs via feature (actual: {actual_exposure} µs)")
+                    self._cam.get_feature_by_name('ExposureTime').set(exposure_us)
                 except Exception as e2:
-                    print(f"❌ Failed to set exposure with alternative method: {e2}")
-        else:
-            print(f"❌ Camera not available for exposure setting")
+                    print(f"ERROR: [{self.camera_id}] set_exposure fallback failed: {e2}")
 
     def set_gain(self, gain_db: float) -> None:
         """Set camera gain in dB."""
         if hasattr(self, '_cam') and self._cam:
             try:
                 self._cam.Gain.set(gain_db)
-                print(f"Successfully set gain to {gain_db} dB")
             except Exception as e:
-                print(f"Failed to set gain: {e}")
-                # Try alternative method
+                print(f"ERROR: [{self.camera_id}] set_gain failed: {e}")
                 try:
                     self._cam.get_feature_by_name('Gain').set(gain_db)
-                    print(f"Successfully set gain to {gain_db} dB (alternative method)")
                 except Exception as e2:
-                    print(f"Failed to set gain with alternative method: {e2}")
+                    print(f"ERROR: [{self.camera_id}] set_gain fallback failed: {e2}")
 
     def set_frame_rate(self, fps: float):
         if self._cam:
@@ -318,60 +298,54 @@ class VimbaCamera(BaseCamera):
 
     def capture_single_frame(self, timeout_ms: int = 2000):
         """Capture a single frame synchronously (for time-multiplexed mode).
-        
+
         Returns the frame as numpy array or None if failed.
         """
         if not self._cam:
-            print(f"❌ Camera {self.camera_id} not available for single capture")
+            print(f"ERROR: Camera {self.camera_id} not available for single capture")
             return None
-            
+
         try:
-            # Use get_frame() for synchronous single-frame capture
             frame = self._cam.get_frame(timeout_ms=timeout_ms)
-            
             if frame.get_status() == FrameStatus.Complete:
-                img = frame.as_numpy_ndarray()
-                print(f"📸 Single frame captured from {self.camera_id}: {img.shape}")
-                return img.copy()
+                return frame.as_numpy_ndarray().copy()
             else:
-                print(f"⚠ Single capture got incomplete frame from {self.camera_id}: status={frame.get_status()}")
+                print(f"WARNING: [{self.camera_id}] single capture incomplete frame: status={frame.get_status()}")
                 return None
         except Exception as e:
-            print(f"❌ Single frame capture error for {self.camera_id}: {e}")
+            print(f"ERROR: [{self.camera_id}] single frame capture: {e}")
             return None
 
     def open_for_capture(self):
         """Open camera for single-frame capture mode (not streaming)."""
         if not self._cam:
-            print(f"❌ No camera attached")
+            print(f"ERROR: No camera attached to open_for_capture")
             return False
-            
+        if self._cam_open:
+            return True  # already open from multiplexed mode
         try:
             from vimba import AccessMode
             self._cam.set_access_mode(AccessMode.Full)
             self._cam.__enter__()
-            
-            # Set pixel format
+            self._cam_open = True
             try:
                 from vimba import PixelFormat as PF
                 self._cam.set_pixel_format(PF.Mono8)
-            except:
+            except Exception:
                 pass
-                
-            print(f"✓ Camera {self.camera_id} opened for single-frame capture")
             return True
         except Exception as e:
-            print(f"❌ Failed to open camera {self.camera_id}: {e}")
+            print(f"ERROR: Failed to open camera {self.camera_id} for capture: {e}")
             return False
 
     def close_capture(self):
-        """Close camera after single-frame capture session."""
-        if self._cam:
+        """Close camera after single-frame capture session (no-op if multiplexed mode owns it)."""
+        if self._cam and self._cam_open and not self._running:
             try:
                 self._cam.__exit__(None, None, None)
-                print(f"✓ Camera {self.camera_id} closed")
             except Exception as e:
-                print(f"⚠ Error closing camera {self.camera_id}: {e}")
+                print(f"WARNING: Error closing camera {self.camera_id}: {e}")
+            self._cam_open = False
 
 
 class CameraController:
@@ -391,17 +365,12 @@ class CameraController:
 
     def start(self):
         """Discover and start all connected cameras."""
-        print("=== CAMERA CONTROLLER STARTUP ===")
-        
-        # 1. Try Vimba
         if self.Vimba:
             try:
                 self._vimba_ctx = self.Vimba.get_instance()
                 self._vimba_ctx.__enter__()
-                
+
                 cams_found = self._vimba_ctx.get_all_cameras()
-                print(f"✓ Vimba found {len(cams_found)} camera(s)")
-                
                 for cam_obj in cams_found:
                     q = Queue(maxsize=30)
                     vcam = VimbaCamera(q)
@@ -409,28 +378,24 @@ class CameraController:
                     self.cameras.append(vcam)
                     self.queues.append(q)
 
-                    
             except Exception as e:
-                print(f"❌ Error initializing Vimba: {e}")
-                print(f"❌ Failed to initialize Vimba: {e}")
+                print(f"ERROR: Failed to initialize Vimba: {e}")
                 if self._vimba_ctx:
                     self._vimba_ctx.__exit__(None, None, None)
                     self._vimba_ctx = None
-        
-        # 2. If no cameras found, do NOT fall back to mock cameras (per user request)
+
         if len(self.cameras) == 0:
-            print("❌ No cameras detected! Please check connections.")
-                
-        # 3. Start all cameras with staggered delays
+            print("ERROR: No cameras detected. Check connections.")
+            return
+
+        # Start cameras with staggered delays to prevent simultaneous stream bursts
         import time
         for i, cam in enumerate(self.cameras):
-            print(f"Starting camera #{i}...")
             cam.start()
             if i < len(self.cameras) - 1:
-                print(f"⏳ Waiting 3 seconds before starting next camera...")
-                time.sleep(3)  # Stagger to prevent simultaneous stream bursts
-            
-        print(f"✓ All {len(self.cameras)} cameras started.")
+                time.sleep(3)
+
+        print(f"Camera controller started: {len(self.cameras)} camera(s)")
 
 
     def stop(self):
@@ -458,52 +423,60 @@ class CameraController:
     def get_queues(self) -> List[Queue]:
         return self.queues
 
-    def start_multiplexed(self, interval_seconds: float = 1.0):
+    def start_multiplexed(self, interval_seconds: float = 0.333):
         """Start TRUE time-multiplexed capture mode.
-        
+
         Only ONE camera is ever active at a time:
-        - t=0.0: Start Camera 0, capture frame, stop
-        - t=0.5: Start Camera 1, capture frame, stop  
-        - t=1.0: Start Camera 0, capture frame, stop
+        - t=0.000: Start Camera 0, capture frame, stop
+        - t=0.167: Start Camera 1, capture frame, stop
+        - t=0.333: Start Camera 0, capture frame, stop
         - etc.
         
         Args:
             interval_seconds: Total cycle time for one full round of all cameras.
         """
-        print("=== STARTING TRUE ALTERNATING CAPTURE MODE ===")
-        
-        # 1. Discover cameras (don't start them yet)
         if self.Vimba and len(self.cameras) == 0:
             try:
                 self._vimba_ctx = self.Vimba.get_instance()
                 self._vimba_ctx.__enter__()
-                
+
                 cams_found = self._vimba_ctx.get_all_cameras()
-                print(f"✓ Vimba found {len(cams_found)} camera(s)")
-                
                 for cam_obj in cams_found:
                     q = Queue(maxsize=30)
                     vcam = VimbaCamera(q)
                     vcam.attach_camera(cam_obj)
                     self.cameras.append(vcam)
                     self.queues.append(q)
-                    
+
             except Exception as e:
-                print(f"❌ Error discovering cameras: {e}")
+                print(f"ERROR: Failed to discover cameras: {e}")
                 if self._vimba_ctx:
                     self._vimba_ctx.__exit__(None, None, None)
                     self._vimba_ctx = None
                 return
-        
+
         if len(self.cameras) == 0:
-            print("❌ No cameras available for multiplexed capture")
+            print("ERROR: No cameras available for multiplexed capture.")
+            return
+
+        # Pre-open all cameras ONCE so the alternating loop only toggles streaming
+        # (eliminates the ~850ms open_took per cycle seen in traces)
+        print(f"Pre-opening {len(self.cameras)} camera(s)...")
+        available = []
+        for cam in self.cameras:
+            try:
+                cam.open_camera()
+                available.append(cam)
+            except Exception as e:
+                print(f"ERROR: Could not pre-open {cam.camera_id}, skipping: {e}")
+
+        if not available:
+            print("ERROR: No cameras successfully opened.")
             return
 
         num_cameras = len(self.cameras)
         per_camera_interval = interval_seconds / num_cameras
-        print(f"📸 Alternating mode: {num_cameras} cameras, {per_camera_interval}s per camera")
-        
-        # Start the alternating capture thread
+
         self._multiplex_stop = threading.Event()
         self._multiplex_thread = threading.Thread(
             target=self._alternating_capture_loop,
@@ -511,59 +484,83 @@ class CameraController:
             daemon=True
         )
         self._multiplex_thread.start()
-        print("✓ Alternating capture scheduler started")
+        print(f"Multiplexed capture started: {num_cameras} camera(s), {per_camera_interval:.3f}s per camera")
     
     def _alternating_capture_loop(self, capture_interval: float):
-        """True alternating capture - only ONE camera active at any time."""
+        """Pipelined alternating capture.
+
+        Key insight from traces:
+          - stream_start_took: ~50ms
+          - time-to-first-frame: ~440ms  (camera hardware — 2 frame periods at 4.5fps)
+          - stop_streaming() blocks: ~270ms (Vimba waits for in-flight frame to finish)
+
+        Old sequential:
+          [start 50ms][exposure 440ms][stop 270ms] | [start 50ms][exposure 440ms][stop 270ms]
+          Total cycle: 1520ms
+
+        New pipelined: after getting the frame event, start the next camera FIRST,
+        then stop the current one. The 270ms stop overlaps with the next camera's
+        440ms exposure warmup instead of adding to it.
+          [start 50ms][exposure 440ms][stop 270ms]
+                                      [start 50ms][exposure 440ms][stop 270ms]
+          Total cycle: ~980ms (~35% reduction)
+
+        Both cameras stream simultaneously for ~270ms. Bandwidth stays safe:
+        2 x 31MB/s = 62MB/s < 125MB/s GigE capacity.
+        """
         import time
-        
+
         num_cameras = len(self.cameras)
         current_camera = 0
-        
-        print(f"=== ALTERNATING CAPTURE LOOP STARTED ===")
-        print(f"    {num_cameras} cameras, {capture_interval}s between each")
-        
+
+        # Pre-start the first camera before entering the loop so the first
+        # iteration can go straight to waiting for the frame event
+        first_cam = self.cameras[0]
+        first_cam._frame_event.clear()
+        try:
+            t0 = time.time()
+            first_cam.start()
+            # print(f"[PIPE|cam0|2_STREAM_START] t={time.time():.3f} pre-loop start_took={time.time()-t0:.3f}s")
+        except Exception as e:
+            print(f"[PIPE|cam0|2_ERROR] Failed pre-loop start: {e}")
+
         while not self._multiplex_stop.is_set():
             cam = self.cameras[current_camera]
-            q = self.queues[current_camera]
-            
+            next_idx = (current_camera + 1) % num_cameras
+            next_cam = self.cameras[next_idx]
+
+            # Wait for current camera's frame via event.
+            # _frame_event is set in _on_frame(), independent of the processing
+            # thread that consumes from the queue — no race condition.
+            t_wait = time.time()
+            frame_received = cam._frame_event.wait(timeout=0.5)
+            t_frame = time.time()
+
+            if frame_received:
+                pass  # print(f"[PIPE|cam{current_camera}|2_FRAME_EVENT] t={t_frame:.3f} waited={t_frame-t_wait:.3f}s")
+            else:
+                print(f"WARNING: cam{current_camera} no frame in 0.5s timeout")
+
+            # PIPELINE: start next camera BEFORE stopping current.
+            # Next camera begins its 440ms exposure while current camera's
+            # 270ms stop_streaming() blocks — they overlap instead of stacking.
+            next_cam._frame_event.clear()
+            t_next = time.time()
             try:
-                # START this camera
-                print(f"📷 [{current_camera}] Starting camera...")
-                cam.start()
-                
-                # Wait for a frame to arrive in the queue
-                start_time = time.time()
-                frame_received = False
-                while time.time() - start_time < 2.0:  # 2s timeout
-                    if not q.empty():
-                        # Frame captured! Leave it in the queue for backend to process
-                        frame_received = True
-                        print(f"✓ [{current_camera}] Frame captured")
-                        break
-                    time.sleep(0.05)
-                
-                if not frame_received:
-                    print(f"⚠ [{current_camera}] No frame received in 2s timeout")
-                
-                # STOP this camera
-                print(f"🛑 [{current_camera}] Stopping camera...")
-                cam.stop()
-                
+                next_cam.start()
+                # print(f"[PIPE|cam{next_idx}|2_STREAM_START] t={time.time():.3f} start_took={time.time()-t_next:.3f}s (overlapping cam{current_camera} stop)")
             except Exception as e:
-                print(f"❌ [{current_camera}] Error: {e}")
-                try:
-                    cam.stop()
-                except:
-                    pass
-            
-            # Move to next camera
-            current_camera = (current_camera + 1) % num_cameras
-            
-            # Wait before starting next camera
-            time.sleep(capture_interval)
-        
-        print("=== ALTERNATING CAPTURE LOOP STOPPED ===")
+                print(f"ERROR: cam{next_idx} failed to start: {e}")
+
+            # Stop current camera — next camera is already exposing during this 270ms
+            t_stop = time.time()
+            try:
+                cam.stop()
+            except Exception as e:
+                print(f"ERROR: cam{current_camera} failed to stop: {e}")
+            # print(f"[PIPE|cam{current_camera}|2_STREAM_STOP] t={time.time():.3f} stop_took={time.time()-t_stop:.3f}s")
+
+            current_camera = next_idx
     
     def stop_multiplexed(self):
         """Stop time-multiplexed capture mode."""
@@ -571,12 +568,10 @@ class CameraController:
             self._multiplex_stop.set()
         if hasattr(self, '_multiplex_thread') and self._multiplex_thread.is_alive():
             self._multiplex_thread.join(timeout=2.0)
-        
-        # Make sure all cameras are stopped
+
+        # Close all cameras (stop streaming + close context)
         for cam in self.cameras:
             try:
-                cam.stop()
-            except:
+                cam.close()
+            except Exception:
                 pass
-        
-        print("✓ Alternating capture stopped")
