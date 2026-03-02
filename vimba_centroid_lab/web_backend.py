@@ -1071,6 +1071,34 @@ async def index():
                     transform: scale(1.01);
                 }
 
+                .flip-controls {
+                    display: flex;
+                    gap: 8px;
+                    justify-content: center;
+                    margin-top: 8px;
+                }
+
+                .btn-flip {
+                    padding: 4px 12px;
+                    border-radius: 8px;
+                    border: 1.5px solid #667eea;
+                    background: transparent;
+                    color: #667eea;
+                    font-size: 0.8rem;
+                    font-weight: 600;
+                    cursor: pointer;
+                    transition: all 0.15s ease;
+                }
+
+                .btn-flip:hover {
+                    background: rgba(102, 126, 234, 0.1);
+                }
+
+                .btn-flip.active {
+                    background: #667eea;
+                    color: white;
+                }
+
                 .cam-title {
                     margin-bottom: 10px;
                     color: #667eea;
@@ -1491,6 +1519,17 @@ async def index():
                 // Initialize as empty arrays, will be populated based on camera count
                 let cameraStreaming = [];
                 let cameraWebsockets = [];
+
+                // Per-camera flip state — persists across stream restarts
+                const flipState = {};
+
+                function updateFlipTransform(idx) {
+                    const img = document.getElementById(`stream-${idx}`);
+                    if (!img) return;
+                    const sx = flipState[idx].h ? -1 : 1;
+                    const sy = flipState[idx].v ? -1 : 1;
+                    img.style.transform = `scaleX(${sx}) scaleY(${sy})`;
+                }
                 
                 // Initialize controls on load
                 async function initializeCameraControls() {
@@ -1559,7 +1598,37 @@ async def index():
                         img.alt = `Live stream camera ${cameraIndex}`;
                         img.onclick = (e) => handleImageClick(e, cameraIndex);
                         card.appendChild(img);
-                        
+
+                        // Flip controls
+                        if (!flipState[cameraIndex]) flipState[cameraIndex] = { h: false, v: false };
+
+                        const flipControls = document.createElement('div');
+                        flipControls.className = 'flip-controls';
+
+                        const btnH = document.createElement('button');
+                        btnH.className = 'btn-flip' + (flipState[cameraIndex].h ? ' active' : '');
+                        btnH.textContent = '↔ Flip H';
+                        btnH.onclick = () => {
+                            flipState[cameraIndex].h = !flipState[cameraIndex].h;
+                            btnH.classList.toggle('active', flipState[cameraIndex].h);
+                            updateFlipTransform(cameraIndex);
+                        };
+
+                        const btnV = document.createElement('button');
+                        btnV.className = 'btn-flip' + (flipState[cameraIndex].v ? ' active' : '');
+                        btnV.textContent = '↕ Flip V';
+                        btnV.onclick = () => {
+                            flipState[cameraIndex].v = !flipState[cameraIndex].v;
+                            btnV.classList.toggle('active', flipState[cameraIndex].v);
+                            updateFlipTransform(cameraIndex);
+                        };
+
+                        flipControls.appendChild(btnH);
+                        flipControls.appendChild(btnV);
+                        card.appendChild(flipControls);
+
+                        updateFlipTransform(cameraIndex);
+
                         cameraGrid.appendChild(card);
                     }
                     
@@ -1663,7 +1732,40 @@ async def index():
                         img.alt = `Live stream camera ${i}`;
                         img.onclick = (e) => handleImageClick(e, i); // Pass index
                         card.appendChild(img);
-                        
+
+                        // Flip controls — one row per camera, state persists across restarts
+                        if (!flipState[i]) flipState[i] = { h: false, v: false };
+
+                        const flipControls = document.createElement('div');
+                        flipControls.className = 'flip-controls';
+
+                        const camIdx = i; // capture for closure
+
+                        const btnH = document.createElement('button');
+                        btnH.className = 'btn-flip' + (flipState[camIdx].h ? ' active' : '');
+                        btnH.textContent = '↔ Flip H';
+                        btnH.onclick = () => {
+                            flipState[camIdx].h = !flipState[camIdx].h;
+                            btnH.classList.toggle('active', flipState[camIdx].h);
+                            updateFlipTransform(camIdx);
+                        };
+
+                        const btnV = document.createElement('button');
+                        btnV.className = 'btn-flip' + (flipState[camIdx].v ? ' active' : '');
+                        btnV.textContent = '↕ Flip V';
+                        btnV.onclick = () => {
+                            flipState[camIdx].v = !flipState[camIdx].v;
+                            btnV.classList.toggle('active', flipState[camIdx].v);
+                            updateFlipTransform(camIdx);
+                        };
+
+                        flipControls.appendChild(btnH);
+                        flipControls.appendChild(btnV);
+                        card.appendChild(flipControls);
+
+                        // Apply any persisted flip from before stream restart
+                        updateFlipTransform(camIdx);
+
                         cameraGrid.appendChild(card);
                         
                         // Setup WebSocket

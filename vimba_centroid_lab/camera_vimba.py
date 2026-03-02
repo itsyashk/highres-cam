@@ -113,6 +113,7 @@ class VimbaCamera(BaseCamera):
         self._frame_seq = 0            # monotonic frame counter for pipeline tracing
         self._cam_open = False         # True after __enter__() — camera stays open between streaming cycles
         self._frame_event = threading.Event()  # set by _on_frame so the loop doesn't race the processing thread
+        self._open_failed = False      # True if open permanently failed — prevents retry spam
 
     # ------------------------------------------------------------------
     # Internal callbacks
@@ -166,18 +167,46 @@ class VimbaCamera(BaseCamera):
         if self._cam_open:
             return  # already open, nothing to do
 
+        if self._open_failed:
+            raise RuntimeError(f"Camera {self.camera_id} previously failed to open — skipping")
+
         if not self._cam:
             raise RuntimeError("Camera not initialized. Controller must assign a camera instance.")
 
         from vimba import AccessMode  # type: ignore
         t0 = time.time()
+
+        # set_access_mode() must be called BEFORE __enter__().
+        # If it raises "inside of 'with'" the camera is already open at the SDK level
+        # (left in that state by a previous failed __enter__() call) — treat as open.
         try:
             self._cam.set_access_mode(AccessMode.Full)
-            self._cam.__enter__()
-            self._cam_open = True
         except Exception as e:
-            print(f"ERROR: Failed to open camera {self.camera_id}: {e}")
-            raise
+            if 'inside of' in str(e):
+                # Camera already entered at SDK level despite _cam_open=False.
+                # This happens when a previous __enter__() threw partway through.
+                # Mark open and continue to streaming without re-entering.
+                print(f"WARNING: {self.camera_id} already in SDK 'with' scope — treating as open")
+                self._cam_open = True
+            else:
+                print(f"ERROR: Failed to open camera {self.camera_id}: {e}")
+                self._open_failed = True
+                raise
+
+        if not self._cam_open:
+            try:
+                self._cam.__enter__()
+                self._cam_open = True
+            except Exception as e:
+                # __enter__() may leave camera partially open at C++ level.
+                # Try to exit cleanly, then give up on this camera.
+                try:
+                    self._cam.__exit__(None, None, None)
+                except Exception:
+                    pass
+                print(f"ERROR: Failed to open camera {self.camera_id}: {e}")
+                self._open_failed = True
+                raise
 
         # GigE packet size negotiation — one-time, MTU doesn't change
         try:
@@ -229,6 +258,8 @@ class VimbaCamera(BaseCamera):
 
     def start(self):
         """Start streaming only — camera must already be open via open_camera()."""
+        if self._open_failed:
+            raise RuntimeError(f"Camera {self.camera_id} is unavailable")
         if not self._cam_open:
             # Fallback: open on first call if open_camera() wasn't called beforehand
             self.open_camera()
